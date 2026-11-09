@@ -1,0 +1,113 @@
+# Python bytecode and native build products
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.dylib
+*.dll
+*.egg-info/
+*.egg
+.eggs/
+/build/
+/dist/
+/wheels/
+/pip-wheel-metadata/
+
+# Local environments and dependency caches (keep uv.lock and .python-version)
+.venv/
+/venv/
+/env/
+/ENV/
+.uv-cache/
+.pip-cache/
+__pypackages__/
+
+# Linting, type checking, tests, and coverage
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.pytest_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+/coverage.xml
+/junit.xml
+
+# JAX/XLA compilation caches, debug dumps, and profiling output
+.jax_cache/
+.jax_compilation_cache/
+.cache/
+/jax_cache/
+/xla_dump/
+/profiles/
+*.prof
+*.lprof
+
+# Experiment tracking and generated run outputs
+/wandb/
+/.wandb/
+/runs/
+/outputs/
+/multirun/
+/logs/
+/tensorboard/
+events.out.tfevents.*
+*.log
+/slurm-*.out
+/slurm-*.err
+
+# Checkpoints, downloaded artifacts, and future replay-buffer storage
+# Keep binary artifacts in these directories instead of ignoring all file types.
+/checkpoints/
+/artifacts/
+/replay_buffers/
+
+# Local datasets and generated evaluation results (root-relative on purpose)
+# src/craft/data/, configs/data/, and tests/fixtures/ remain versioned.
+/data/
+/datasets/
+/downloads/
+/results/
+/videos/
+
+# Notebook checkpoints and generated documentation
+.ipynb_checkpoints/
+/docs/_build/
+/site/
+
+# Local credentials and configuration; sanitized examples may be committed
+.env
+.env.*
+!.env.example
+!.env.*.example
+!.env.template
+.envrc
+.netrc
+.python_history
+/configs/local/
+*.local.yaml
+*.local.yml
+
+# Editors: allow portable VS Code configuration to be shared
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+*.code-workspace
+*.swp
+*.swo
+*~
+
+# OS metadata and temporary work
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
+/tmp/
+/temp/
+*.tmp

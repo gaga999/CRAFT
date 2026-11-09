@@ -1,0 +1,31 @@
+# Illustrative configuration, not a finalized research protocol.
+seed: 0
+agent:
+  name: craft
+models:
+  encoder:
+    name: mlp
+    hidden_dims: [256, 256]
+    output_dim: 128
+policy:
+  name: latent_chunk
+  chunk_length: 8
+  execution_length: 1
+  action_dim: 2  # Example only; obtain from the actual environment.
+data:
+  path: null  # Set when the dataset loader is implemented.
+  batch_size: 256
+env:
+  name: null  # Select the benchmark before implementing its adapter.
+train:
+  mode: offline
+  stages:
+    - name: representation
+      steps: 100000
+    - name: action
+      steps: 200000
+logging:
+  backend: console  # W&B adapter is pending.
+  project: craft
+checkpoint:
+  directory: runs/checkpoints
