@@ -1,16 +1,22 @@
 """Episode-safe chunks and future goals from regular (noncompact) OGBench data."""
 
+import hashlib
+
 import numpy as np
 
 
 class OfflineDataset:
-    def __init__(self, data, chunk_length=1, seed=0, discount=0.99):
+    def __init__(self, data, chunk_length=1, seed=0, discount=0.95):
         if chunk_length < 1 or not 0 < discount < 1:
             raise ValueError("Require positive chunk length and discount in (0, 1)")
         self.data = data
         self.chunk_length = chunk_length
         self.discount = discount
         self.rng = np.random.default_rng(seed)
+        if not {"observations", "actions", "next_observations", "terminals"} <= set(
+            data
+        ):
+            raise ValueError("Incomplete transition dataset")
         s, a = data["observations"], data["actions"]
         n = len(s)
         if s.ndim != 2 or a.ndim != 2 or not np.issubdtype(a.dtype, np.floating):
@@ -21,6 +27,17 @@ class OfflineDataset:
             len(data[k]) != n for k in ("actions", "terminals", "next_observations")
         ):
             raise ValueError("Dataset arrays must have matching lengths")
+        if data["next_observations"].shape != s.shape or data["terminals"].shape != (
+            n,
+        ):
+            raise ValueError("Expected next_observations [N,O] and terminals [N]")
+        for key in ("observations", "actions", "next_observations", "terminals"):
+            value = data[key]
+            for start in range(0, n, 65536):
+                if not np.isfinite(value[start : start + 65536]).all():
+                    raise ValueError(f"Nonfinite dataset values: {key}")
+        if not np.isin(data["terminals"], [0, 1]).all():
+            raise ValueError("terminals must be binary episode boundaries")
         ends = np.flatnonzero(data["terminals"] > 0)
         if n == 0 or len(ends) == 0 or ends[-1] != n - 1:
             raise ValueError("Dataset must end at an episode boundary")
@@ -30,6 +47,15 @@ class OfflineDataset:
             raise ValueError("No episode is long enough for the requested chunk")
         if np.any(np.abs(a) > 1.0001):
             raise ValueError("Expected OGBench actions normalized to [-1, 1]")
+
+    def fingerprint(self):
+        h = hashlib.sha256()
+        for key in ("observations", "actions", "next_observations", "terminals"):
+            value = self.data[key]
+            h.update(f"{key}:{value.shape}:{value.dtype}".encode())
+            for start in range(0, len(value), 65536):
+                h.update(np.ascontiguousarray(value[start : start + 65536]).tobytes())
+        return h.hexdigest()
 
     def sample(self, batch_size):
         if batch_size < 2:

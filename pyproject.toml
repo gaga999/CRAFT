@@ -11,6 +11,7 @@ dependencies = [
     "flax>=0.12.12",
     "jax>=0.12.0.1",
     "numpy>=2.5.4",
+    "ogbench>=1.2.2",
     "omegaconf>=2.4.0",
     "optax>=0.2.8",
     "wandb>=0.31.0",
@@ -20,7 +21,6 @@ dependencies = [
 craft = "craft:main"
 
 [project.optional-dependencies]
-ogbench = ["ogbench>=1.2.0"]
 cuda = [
     "jax[cuda13]>=0.12.0.1 ; (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')",
 ]

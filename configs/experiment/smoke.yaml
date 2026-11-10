@@ -8,11 +8,12 @@ agent:
   latent_dim: 8
   learning_rate: 0.0003
   flow_steps: 2
-  alpha: 10.0
+  max_grad_norm: 10.0
+  distillation_weight: 0.1
 data:
   synthetic: true
   batch_size: 4
-  discount: 0.99
+  discount: 0.95
 train:
   stages:
     - name: joint

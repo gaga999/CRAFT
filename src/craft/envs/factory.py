@@ -1,17 +1,11 @@
-"""OGBench integration uses its official loader and independent train/val splits."""
+"""Official OGBench adapters with resource-safe construction and shape checks."""
+
+import numpy as np
 
 from craft.data.offline import OfflineDataset
 
 
-def make_env_and_datasets(
-    name,
-    *,
-    chunk_length,
-    seed,
-    discount=0.99,
-    dataset_dir="~/.ogbench/data",
-    dataset_path=None,
-):
+def make_env(name):
     if any(
         mode in name.split("-")
         for mode in ("visual", "powderworld", "oraclerep", "singletask")
@@ -19,25 +13,62 @@ def make_env_and_datasets(
         raise ValueError(
             "Only standard state-based goal-conditioned continuous datasets are supported"
         )
+    import ogbench
+    from gymnasium.spaces import Box
+
+    env = ogbench.make_env_and_datasets(name, env_only=True)
     try:
-        import ogbench
-    except ImportError as exc:
-        raise ImportError("Install OGBench with: uv sync --extra ogbench") from exc
-    env, train, val = ogbench.make_env_and_datasets(
-        name, dataset_dir=dataset_dir, dataset_path=dataset_path, compact_dataset=False
-    )
-    try:
-        if len(env.action_space.shape) != 1 or len(env.observation_space.shape) != 1:
+        if not all(
+            isinstance(space, Box) and len(space.shape) == 1
+            for space in (env.action_space, env.observation_space)
+        ):
             raise ValueError(
-                "Only state-based continuous-action OGBench datasets are supported"
+                "Expected vector observations and continuous vector actions"
             )
+        if not np.allclose(env.action_space.low, -1) or not np.allclose(
+            env.action_space.high, 1
+        ):
+            raise ValueError("Expected action space bounds [-1,1]")
+    except BaseException:
+        env.close()
+        raise
+    return env
+
+
+def make_env_and_datasets(
+    name,
+    *,
+    chunk_length,
+    seed,
+    discount=0.95,
+    dataset_dir="data/ogbench",
+    dataset_path=None,
+):
+    import ogbench
+
+    env = make_env(name)
+    try:
+        train, val = ogbench.make_env_and_datasets(
+            name,
+            dataset_dir=dataset_dir,
+            dataset_path=dataset_path,
+            compact_dataset=False,
+            dataset_only=True,
+            cur_env=env,
+        )
         train = OfflineDataset(train, chunk_length, seed, discount)
         val = (
             None
             if val is None
             else OfflineDataset(val, chunk_length, seed + 1, discount)
         )
-    except Exception:
+        for source in (train, val):
+            if source is not None and (
+                source.data["observations"].shape[1:] != env.observation_space.shape
+                or source.data["actions"].shape[1:] != env.action_space.shape
+            ):
+                raise ValueError("Dataset dimensions disagree with environment spaces")
+    except BaseException:
         env.close()
         raise
     return env, train, val

@@ -1,35 +1,47 @@
-"""Local JSONL metrics with an optional W&B backend."""
+"""One metrics stream per session; no accidental append or cloud-run reuse."""
 
 import json
-from pathlib import Path
 
 
 class Logger:
     def __init__(self, directory, config):
-        self.directory = Path(directory)
-        self.directory.mkdir(parents=True, exist_ok=True)
+        self.stream = (directory / "metrics.jsonl").open("x")
+        self.last_step = -1
         self.run = None
-        if config["logging"]["backend"] == "wandb":
-            import wandb
+        try:
+            if config["logging"]["backend"] == "wandb":
+                import wandb
 
-            self.run = wandb.init(
-                project=config["logging"]["project"],
-                config=config,
-                dir=str(self.directory),
-            )
-        elif config["logging"]["backend"] != "console":
-            raise ValueError("Unknown logging backend")
-        self.stream = (self.directory / "metrics.jsonl").open("a")
+                self.run = wandb.init(
+                    project=config["logging"]["project"],
+                    config=config,
+                    dir=str(directory),
+                    name=directory.name,
+                    resume="never",
+                )
+            elif config["logging"]["backend"] != "console":
+                raise ValueError("Unknown logging backend")
+        except BaseException:
+            self.stream.close()
+            raise
 
     def log(self, metrics, *, step):
+        if step <= self.last_step:
+            raise ValueError(
+                "Metrics must have strictly increasing steps within a session"
+            )
         metrics = {key: float(value) for key, value in metrics.items()}
-        self.stream.write(json.dumps({"step": step, **metrics}, allow_nan=False) + "\n")
+        line = json.dumps({"step": step, **metrics}, allow_nan=False)
+        self.stream.write(line + "\n")
         self.stream.flush()
         if self.run is not None:
             self.run.log(metrics, step=step)
-        print(f"step={step} {metrics}")
+        self.last_step = step
+        print(f"step={step} {metrics}", flush=True)
 
     def close(self):
-        self.stream.close()
-        if self.run is not None:
-            self.run.finish()
+        try:
+            if self.run is not None:
+                self.run.finish()
+        finally:
+            self.stream.close()

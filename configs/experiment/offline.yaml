@@ -8,14 +8,15 @@ agent:
   latent_dim: 128
   learning_rate: 0.0003
   flow_steps: 10
-  alpha: 10.0
+  max_grad_norm: 10.0
+  distillation_weight: 0.1
 data:
   name: pointmaze-medium-navigate-v0
-  directory: ~/.ogbench/data
+  directory: data/ogbench
   path: null
   synthetic: false
   batch_size: 256
-  discount: 0.99
+  discount: 0.95
 train:
   stages:
     - name: joint

@@ -1,103 +1,169 @@
-"""Shared token-wise FFNs with periodic MLP-based information exchange."""
+"""NNX token-wise shared FFNs with periodic residual MLP exchange."""
 
 import jax.numpy as jnp
-from flax import linen as nn
+from flax import nnx
+
+from craft.models.mlp import MLP
 
 
-class TokenBackbone(nn.Module):
-    width: int = 128
-    depth: int = 2
-    exchange_every: int = 2
+class MixerBlock(nnx.Module):
+    def __init__(self, width, tokens, exchange, *, rngs):
+        self.ffn_norm = nnx.LayerNorm(width, rngs=rngs)
+        self.ffn = MLP(width, (4 * width,), width, rngs=rngs)
+        self.exchange = exchange
+        if exchange:
+            self.token_norm = nnx.LayerNorm(width, rngs=rngs)
+            self.token_mlp = MLP(tokens, (2 * tokens,), tokens, rngs=rngs)
 
-    @nn.compact
-    def __call__(self, state, actions, condition=None):
-        s = nn.Dense(self.width, name="state_projection")(state)[:, None]
-        a = nn.Dense(self.width, name="action_projection")(actions)
-        x = jnp.concatenate([s, a], axis=1)
-        x += self.param(
-            "position", nn.initializers.normal(0.02), (1, x.shape[1], self.width)
-        )
-        if condition is not None:
-            x += nn.Dense(self.width, name="condition_projection")(condition)[:, None]
-        if self.depth < 1 or self.exchange_every < 1:
-            raise ValueError("Depth and exchange_every must be positive")
-        for i in range(self.depth):
-            # Dense acts only on channels: one FFN shared across all tokens.
-            # Layers have independent parameters; sharing is across positions.
-            y = nn.LayerNorm(name=f"ffn_norm_{i}")(x)
-            y = nn.gelu(nn.Dense(4 * self.width, name=f"expand_{i}")(y))
-            x += nn.Dense(self.width, name=f"contract_{i}")(y)
-            if (i + 1) % self.exchange_every == 0 or i == self.depth - 1:
-                # [B,T,C] -> [B,C,T]: the same token MLP is used per channel.
-                y = nn.LayerNorm(name=f"exchange_norm_{i}")(x)
-                y = jnp.swapaxes(y, -1, -2)
-                y = nn.gelu(nn.Dense(2 * x.shape[1], name=f"token_expand_{i}")(y))
-                y = nn.Dense(x.shape[1], name=f"token_contract_{i}")(y)
-                x += jnp.swapaxes(y, -1, -2)
-        return nn.LayerNorm(name="output_norm")(x)
+    def local(self, x):
+        return x + self.ffn(self.ffn_norm(x))
+
+    def __call__(self, x):
+        x = self.local(x)
+        if self.exchange:
+            y = jnp.swapaxes(self.token_norm(x), -1, -2)
+            x = x + jnp.swapaxes(self.token_mlp(y), -1, -2)
+        return x
 
 
-class GoalEncoder(nn.Module):
-    width: int
-    latent_dim: int
-
-    @nn.compact
-    def __call__(self, state):
-        # Actor-facing features precede the separate contrastive projection head.
-        h = nn.gelu(nn.Dense(self.width)(state))
-        h = nn.LayerNorm()(nn.Dense(self.width)(h))
-        z = nn.Dense(self.latent_dim)(nn.gelu(nn.Dense(self.width)(h)))
-        return h, z
-
-
-class TokenCritic(nn.Module):
-    width: int = 128
-    depth: int = 2
-    exchange_every: int = 2
-    latent_dim: int = 128
-
-    def setup(self):
-        self.goal_encoder = GoalEncoder(self.width, self.latent_dim)
-        self.backbones = [
-            TokenBackbone(
-                self.width, self.depth, self.exchange_every, name=f"tokens_{i}"
+class TokenBackbone(nnx.Module):
+    def __init__(
+        self,
+        observation_dim,
+        action_dim,
+        chunk_length,
+        *,
+        width=128,
+        depth=4,
+        exchange_every=2,
+        condition_dim=0,
+        rngs,
+    ):
+        if any(
+            type(value) is not int or value < 1
+            for value in (
+                observation_dim,
+                action_dim,
+                chunk_length,
+                width,
+                depth,
+                exchange_every,
             )
-            for i in range(2)
-        ]
-        self.phi_heads = [nn.Dense(self.latent_dim, name=f"phi_{i}") for i in range(2)]
-        self.psi_heads = [nn.Dense(self.latent_dim, name=f"psi_{i}") for i in range(2)]
+        ):
+            raise ValueError(
+                "Model dimensions, depth and exchange interval must be positive integers"
+            )
+        if type(condition_dim) is not int or condition_dim < 0:
+            raise ValueError("Condition dimension must be a nonnegative integer")
+        self.state_projection = nnx.Linear(observation_dim, width, rngs=rngs)
+        self.action_projection = nnx.Linear(action_dim, width, rngs=rngs)
+        self.position = nnx.Param(
+            nnx.initializers.normal(0.02)(rngs.params(), (1, chunk_length + 1, width))
+        )
+        self.condition_projection = (
+            nnx.Linear(condition_dim, width, rngs=rngs) if condition_dim else None
+        )
+        self.blocks = nnx.List(
+            [
+                MixerBlock(
+                    width,
+                    chunk_length + 1,
+                    (i + 1) % exchange_every == 0 or i == depth - 1,
+                    rngs=rngs,
+                )
+                for i in range(depth)
+            ]
+        )
+        self.output_norm = nnx.LayerNorm(width, rngs=rngs)
+
+    def tokenize(self, states, actions, condition=None):
+        if (
+            states.ndim != 2
+            or actions.ndim != 3
+            or states.shape[0] != actions.shape[0]
+            or actions.shape[1] != self.position.shape[1] - 1
+        ):
+            raise ValueError(
+                "Expected states [B,O] and configured action chunks [B,H,A]"
+            )
+        if condition is not None and self.condition_projection is None:
+            raise ValueError("This backbone does not accept a condition")
+        x = jnp.concatenate(
+            [self.state_projection(states)[:, None], self.action_projection(actions)], 1
+        )
+        x = x + self.position[...]
+        if self.condition_projection is not None:
+            if condition is None:
+                raise ValueError("Actor condition is required")
+            x = x + self.condition_projection(condition)[:, None]
+        return x
+
+    def __call__(self, states, actions, condition=None):
+        x = self.tokenize(states, actions, condition)
+        for block in self.blocks:
+            x = block(x)
+        return self.output_norm(x)
+
+
+class GoalEncoder(nnx.Module):
+    def __init__(self, observation_dim, width, latent_dim, *, rngs):
+        self.features = MLP(observation_dim, (width,), width, rngs=rngs)
+        self.norm = nnx.LayerNorm(width, rngs=rngs)
+        self.projection = MLP(width, (width,), latent_dim, rngs=rngs)
 
     def encode(self, states):
-        return self.goal_encoder(states)[0]
+        return self.norm(self.features(states))
+
+    def __call__(self, states):
+        h = self.encode(states)
+        return h, self.projection(h)
+
+
+class TokenCritic(nnx.Module):
+    def __init__(
+        self,
+        observation_dim,
+        action_dim,
+        chunk_length,
+        *,
+        width=128,
+        depth=4,
+        exchange_every=2,
+        latent_dim=128,
+        rngs,
+    ):
+        self.goal_encoder = GoalEncoder(observation_dim, width, latent_dim, rngs=rngs)
+        self.backbones = nnx.List(
+            [
+                TokenBackbone(
+                    observation_dim,
+                    action_dim,
+                    chunk_length,
+                    width=width,
+                    depth=depth,
+                    exchange_every=exchange_every,
+                    rngs=rngs,
+                )
+                for _ in range(2)
+            ]
+        )
+        self.phi_heads = nnx.List(
+            [nnx.Linear(width, latent_dim, rngs=rngs) for _ in range(2)]
+        )
+        self.psi_heads = nnx.List(
+            [nnx.Linear(latent_dim, latent_dim, rngs=rngs) for _ in range(2)]
+        )
+
+    def encode(self, states):
+        return self.goal_encoder.encode(states)
 
     def __call__(self, states, actions, goals):
         _, z = self.goal_encoder(goals)
         phi = jnp.stack(
             [
-                head(nn.gelu(net(states, actions)[:, 0]))
+                head(nnx.gelu(net(states, actions)[:, 0]))
                 for net, head in zip(self.backbones, self.phi_heads)
             ]
         )
         psi = jnp.stack([head(z) for head in self.psi_heads])
         return phi, psi
-
-
-class TokenActor(nn.Module):
-    action_dim: int
-    width: int = 128
-    depth: int = 2
-    exchange_every: int = 2
-
-    @nn.compact
-    def __call__(self, states, goals, embeddings, actions, time):
-        # Raw goals, representation features, and time condition all token positions.
-        t = time[:, None]
-        condition = jnp.concatenate(
-            [goals, embeddings, t, jnp.sin(jnp.pi * t), jnp.cos(jnp.pi * t)], axis=-1
-        )
-        x = TokenBackbone(self.width, self.depth, self.exchange_every)(
-            states, actions, condition
-        )
-        return nn.Dense(self.action_dim, kernel_init=nn.initializers.normal(0.01))(
-            x[:, 1:]
-        )

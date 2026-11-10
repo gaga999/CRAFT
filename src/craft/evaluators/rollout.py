@@ -1,36 +1,68 @@
-"""OGBench task evaluation with episode-local chunk caches."""
+"""Task-local evaluation RNG and bounded episode-local chunk execution."""
 
 import jax
 import numpy as np
 
 
-def evaluate_rollouts(act, env, *, episodes=10, seed=0, execution_length=1):
+def evaluate_rollouts(
+    act, env, *, episodes=10, seed=0, execution_length=1, task_ids=()
+):
     if episodes <= 0 or execution_length <= 0:
         raise ValueError("Episodes and execution length must be positive")
     tasks = env.unwrapped.task_infos
+    selected = list(task_ids) if task_ids else list(range(1, len(tasks) + 1))
+    if (
+        not selected
+        or len(set(selected)) != len(selected)
+        or any(task < 1 or task > len(tasks) for task in selected)
+    ):
+        raise ValueError("Invalid evaluation task IDs")
     metrics = {}
-    rng = jax.random.PRNGKey(seed)
-    for task_id, task in enumerate(tasks, 1):
+    limit = getattr(getattr(env, "spec", None), "max_episode_steps", None)
+    if limit is None:
+        raise ValueError("Evaluation requires an environment time limit")
+    for task_id in selected:
         successes = []
+        rng = jax.random.fold_in(jax.random.PRNGKey(seed), task_id)
         for episode in range(episodes):
             observation, info = env.reset(
                 seed=seed + episode, options={"task_id": task_id}
             )
             goal = info["goal"]
-            done = False
+            if np.shape(goal) != np.shape(observation) or not np.isfinite(goal).all():
+                raise ValueError("Goal must be finite and share the observation space")
             success = 0.0
             chunk = None
             position = 0
-            while not done:
-                if chunk is None or position == min(execution_length, len(chunk)):
+            for _ in range(limit):
+                if chunk is None or position == execution_length:
                     rng, key = jax.random.split(rng)
                     chunk = np.asarray(act(observation, goal, key))
+                    if (
+                        chunk.ndim != 2
+                        or chunk.shape[1:] != env.action_space.shape
+                        or len(chunk) < execution_length
+                        or not np.isfinite(chunk).all()
+                        or np.any(np.abs(chunk) > 1.0001)
+                    ):
+                        raise ValueError(
+                            "Policy returned an invalid/nonfinite/out-of-bounds action chunk"
+                        )
                     position = 0
                 observation, _, terminated, truncated, info = env.step(chunk[position])
                 position += 1
-                done = terminated or truncated
-                success = max(success, float(info.get("success", 0)))
+                if "success" not in info or not np.isfinite(info["success"]):
+                    raise ValueError("Environment must expose finite success metrics")
+                success = max(success, float(info["success"]))
+                if terminated or truncated:
+                    break
+            else:
+                raise RuntimeError(
+                    "Environment failed to terminate/truncate within its time limit"
+                )
             successes.append(success)
-        metrics[f"evaluation/{task['task_name']}/success"] = float(np.mean(successes))
+        metrics[f"evaluation/{tasks[task_id - 1]['task_name']}/success"] = float(
+            np.mean(successes)
+        )
     metrics["evaluation/overall_success"] = float(np.mean(list(metrics.values())))
     return metrics

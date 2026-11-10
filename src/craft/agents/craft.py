@@ -1,196 +1,153 @@
-"""Token CRL + representation-conditioned FQL; independent optimizer states."""
+"""NNX CRL/FQL updates with explicit ownership and atomic finite-update guards."""
 
 from functools import partial
-from typing import Any
 
 import jax
 import jax.numpy as jnp
 import optax
-from flax import struct
-from flax.training.train_state import TrainState
+from flax import nnx
 
 from craft.losses.contrastive import contrastive_loss, q_values
 from craft.models.factory import make_crl_models
-from craft.models.tokens import TokenCritic
+from craft.policies.chunk import encode_condition, integrate_flow
 
 
-@struct.dataclass
-class CRAFTAgent:
-    critic: TrainState
-    teacher: TrainState
-    actor: TrainState
-    rng: Any
-    chunk_length: int = struct.field(pytree_node=False)
-    action_dim: int = struct.field(pytree_node=False)
-    flow_steps: int = struct.field(pytree_node=False, default=10)
-    alpha: float = struct.field(pytree_node=False, default=10.0)
+def all_finite(tree):
+    return jnp.all(jnp.stack([jnp.all(jnp.isfinite(x)) for x in jax.tree.leaves(tree)]))
+
+
+class CRAFTAgent(nnx.Module):
+    def __init__(self, seed, observation_dim, action_dim, config):
+        self.critic, self.teacher, self.actor = make_crl_models(
+            config, observation_dim, action_dim, seed
+        )
+        self.observation_dim = observation_dim
+        self.action_dim = action_dim
+        self.flow_steps = config["flow_steps"]
+        self.distillation_weight = config["distillation_weight"]
+        self.chunk_length = config["chunk_length"]
+        self.optimizers = nnx.List(
+            [
+                nnx.Optimizer(
+                    model,
+                    optax.chain(
+                        optax.clip_by_global_norm(config["max_grad_norm"]),
+                        optax.adam(config["learning_rate"]),
+                    ),
+                    wrt=nnx.Param,
+                )
+                for model in (self.critic, self.teacher, self.actor)
+            ]
+        )
+        self.rng = nnx.Variable(jax.random.PRNGKey(seed + 3))
+        self.step = nnx.Variable(jnp.array(0, jnp.int32))
 
     @classmethod
     def create(cls, seed, observation_dim, action_dim, config):
-        h = int(config["chunk_length"])
-        width, depth, exchange_every, latent = [
-            int(config[k]) for k in ("width", "depth", "exchange_every", "latent_dim")
-        ]
-        if (
-            min(
-                h,
-                width,
-                depth,
-                exchange_every,
-                latent,
-                action_dim,
-                observation_dim,
-                int(config["flow_steps"]),
-            )
-            <= 0
-        ):
-            raise ValueError(
-                "Dimensions, depth, exchange_every, and flow steps must be positive"
-            )
-        if config["alpha"] < 0 or config["learning_rate"] <= 0:
-            raise ValueError("Invalid optimizer or distillation settings")
-        keys = jax.random.split(jax.random.PRNGKey(seed), 4)
-        s = jnp.zeros((1, observation_dim))
-        a = jnp.zeros((1, h, action_dim))
-        critic, actor = make_crl_models(config, action_dim)
-        cp = critic.init(keys[0], s, a, s)["params"]
-        ap = actor.init(keys[1], s, s, jnp.zeros((1, width * 2)), a, jnp.zeros(1))[
-            "params"
-        ]
-        tp = actor.init(keys[2], s, s, jnp.zeros((1, width * 2)), a, jnp.zeros(1))[
-            "params"
-        ]
+        from craft.config import validate_agent
 
-        def state(module, params):
-            return TrainState.create(
-                apply_fn=module.apply,
-                params=params,
-                tx=optax.chain(
-                    optax.clip_by_global_norm(10.0), optax.adam(config["learning_rate"])
-                ),
-            )
+        validate_agent(config)
+        if min(observation_dim, action_dim) <= 0:
+            raise ValueError("Observation/action dimensions must be positive")
+        return cls(seed, observation_dim, action_dim, config)
 
-        return cls(
-            state(critic, cp),
-            state(actor, tp),
-            state(actor, ap),
-            keys[3],
-            h,
-            action_dim,
-            int(config["flow_steps"]),
-            float(config["alpha"]),
-        )
-
-    def embeddings(self, observations, goals):
-        # Reuse the critic's goal/state encoder, but detach actor conditioning.
-        def encode(x):
-            return self.critic.apply_fn(
-                {"params": self.critic.params}, x, method=TokenCritic.encode
-            )
-
-        return jax.lax.stop_gradient(
-            jnp.concatenate([encode(observations), encode(goals)], -1)
-        )
-
-    def integrate(self, observations, goals, embeddings, noise):
-        def step(x, i):
-            t = jnp.full((x.shape[0],), i / self.flow_steps)
-            v = self.teacher.apply_fn(
-                {"params": self.teacher.params}, observations, goals, embeddings, x, t
-            )
-            return x + v / self.flow_steps, None
-
-        return jnp.clip(
-            jax.lax.scan(step, noise, jnp.arange(self.flow_steps))[0], -1, 1
-        )
-
-    @partial(jax.jit, static_argnames=("stage",))
+    @partial(nnx.jit, static_argnames=("stage",))
     def update(self, batch, *, stage="joint"):
         if stage not in ("joint", "representation", "action"):
             raise ValueError(f"Unknown stage: {stage}")
-        s, a = batch["observations"], batch["action_chunks"]
-
-        def critic_loss(params):
-            phi, psi = self.critic.apply_fn(
-                {"params": params}, s, a, batch["value_goals"]
-            )
-            return contrastive_loss(phi, psi)
-
-        critic = self.critic
+        s, actions = batch["observations"], batch["action_chunks"]
         metrics = {}
+        grads = []
         if stage != "action":
-            (_, info), grad = jax.value_and_grad(critic_loss, has_aux=True)(
-                critic.params
+
+            def critic_loss(model):
+                return contrastive_loss(*model(s, actions, batch["value_goals"]))
+
+            (_, info), critic_grad = nnx.value_and_grad(critic_loss, has_aux=True)(
+                self.critic
             )
-            critic = critic.apply_gradients(grads=grad)
+            grads.append(critic_grad)
             metrics.update(info)
-        # Actor updates use the pre-update critic, matching simultaneous reference updates.
-        rng, nk, tk, zk = jax.random.split(self.rng, 4)
-        teacher, actor = self.teacher, self.actor
+            metrics["critic/grad_norm"] = optax.tree.norm(critic_grad)
+        rng, nk, tk, zk = jax.random.split(self.rng[...], 4)
         if stage != "representation":
             goals = batch["actor_goals"]
-            embedding = self.embeddings(s, goals)
-            noise = jax.random.normal(nk, a.shape)
-            t = jax.random.uniform(tk, (a.shape[0],))
-            xt = (1 - t[:, None, None]) * noise + t[:, None, None] * a
+            embedding = encode_condition(self.critic, s, goals)
+            noise = jax.random.normal(nk, actions.shape)
+            t = jax.random.uniform(tk, (actions.shape[0],))
+            xt = (1 - t[:, None, None]) * noise + t[:, None, None] * actions
 
-            def flow_loss(p):
-                pred = teacher.apply_fn({"params": p}, s, goals, embedding, xt, t)
-                return jnp.square(pred - (a - noise)).mean()
+            def flow_loss(model):
+                return jnp.square(
+                    model(s, goals, embedding, xt, t) - (actions - noise)
+                ).mean()
 
-            fm, grad = jax.value_and_grad(flow_loss)(teacher.params)
-            teacher = teacher.apply_gradients(grads=grad)
-            z = jax.random.normal(zk, a.shape)
-            target = jax.lax.stop_gradient(self.integrate(s, goals, embedding, z))
+            fm, teacher_grad = nnx.value_and_grad(flow_loss)(self.teacher)
+            z = jax.random.normal(zk, actions.shape)
+            target = jax.lax.stop_gradient(
+                integrate_flow(self.teacher, s, goals, embedding, z, self.flow_steps)
+            )
 
-            def actor_loss(p):
-                actions = jnp.clip(
-                    actor.apply_fn(
-                        {"params": p}, s, goals, embedding, z, jnp.zeros(a.shape[0])
-                    ),
-                    -1,
-                    1,
-                )
-                phi, psi = self.critic.apply_fn(
-                    {"params": self.critic.params}, s, actions, goals
-                )
-                q = q_values(phi, psi).min(0)
+            def actor_losses(model):
+                raw = model(s, goals, embedding, z, jnp.zeros(actions.shape[0]))
+                proposed = jnp.clip(raw, -1, 1)
+                q = q_values(*self.critic(s, proposed, goals)).min(0)
                 qloss = -q.mean() / jax.lax.stop_gradient(jnp.abs(q).mean() + 1e-6)
-                distill = jnp.square(actions - target).mean()
-                loss = qloss + self.alpha * distill
-                return loss, {
-                    "actor/loss": loss,
-                    "actor/q": q.mean(),
+                distill = jnp.square(proposed - target).mean()
+                return jnp.stack([qloss, self.distillation_weight * distill]), (
+                    q.mean(),
+                    distill,
+                    (jnp.abs(raw) >= 1).mean(),
+                )
+
+            # One reverse pass per component exposes the actual gradient balance.
+            components, pullback, (q, distill, saturation) = nnx.vjp(
+                actor_losses, self.actor, has_aux=True, graph_updates=False
+            )
+            qgrad = pullback(jnp.array([1.0, 0.0]))[0]
+            bcgrad = pullback(jnp.array([0.0, 1.0]))[0]
+            actor_grad = jax.tree.map(lambda a, b: a + b, qgrad, bcgrad)
+            grads.extend([teacher_grad, actor_grad])
+            metrics.update(
+                {
+                    "actor/loss": components.sum(),
+                    "actor/q_loss": components[0],
+                    "actor/weighted_distillation": components[1],
                     "actor/distillation": distill,
                     "actor/flow_loss": fm,
+                    "actor/q": q,
+                    "actor/saturation": saturation,
+                    "actor/q_grad_norm": optax.tree.norm(qgrad),
+                    "actor/distill_grad_norm": optax.tree.norm(bcgrad),
+                    "actor/grad_ratio_distill_to_q": optax.tree.norm(bcgrad)
+                    / (optax.tree.norm(qgrad) + 1e-8),
                 }
+            )
+        finite = all_finite((grads, metrics, batch))
 
-            (_, info), grad = jax.value_and_grad(actor_loss, has_aux=True)(actor.params)
-            actor = actor.apply_gradients(grads=grad)
-            metrics.update(info)
-        return self.replace(
-            critic=critic, teacher=teacher, actor=actor, rng=rng
-        ), metrics
+        def commit(agent):
+            index = 0
+            if stage != "action":
+                agent.optimizers[0].update(agent.critic, grads[index])
+                index += 1
+            if stage != "representation":
+                agent.optimizers[1].update(agent.teacher, grads[index])
+                agent.optimizers[2].update(agent.actor, grads[index + 1])
+            agent.rng[...] = rng
+            agent.step[...] += 1
 
-    @jax.jit
+        nnx.cond(finite, commit, lambda agent: None, self)
+        return {**metrics, "numerics/finite": finite}
+
+    @nnx.jit
     def sample_action_chunk(self, observations, goals, rng):
-        single = observations.ndim == 1
-        if single:
-            observations, goals = observations[None], goals[None]
-        embedding = self.embeddings(observations, goals)
-        noise = jax.random.normal(
-            rng, (observations.shape[0], self.chunk_length, self.action_dim)
+        return self.actor.sample(self.critic, observations, goals, rng)
+
+    @nnx.jit
+    def validation_metrics(self, batch):
+        _, metrics = contrastive_loss(
+            *self.critic(
+                batch["observations"], batch["action_chunks"], batch["value_goals"]
+            )
         )
-        actions = jnp.clip(
-            self.actor.apply_fn(
-                {"params": self.actor.params},
-                observations,
-                goals,
-                embedding,
-                noise,
-                jnp.zeros(observations.shape[0]),
-            ),
-            -1,
-            1,
-        )
-        return actions[0] if single else actions
+        return {f"validation/{key}": value for key, value in metrics.items()}

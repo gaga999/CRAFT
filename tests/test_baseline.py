@@ -1,177 +1,211 @@
-"""Numerical, ownership, sampling, persistence, and rollout contract checks."""
+"""Numerical contracts for the NNX CRL implementation."""
 
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from omegaconf import OmegaConf
+from flax import nnx
 
 from craft.agents.craft import CRAFTAgent
+from craft.config import load_config
 from craft.data.offline import OfflineDataset, synthetic_dataset
 from craft.evaluators.rollout import evaluate_rollouts
 from craft.models.tokens import TokenBackbone
-from craft.utils.checkpoint import restore_checkpoint, save_checkpoint
+from craft.policies.chunk import encode_condition
+from craft.utils.checkpoint import (
+    pure_state,
+    read_checkpoint,
+    restore_checkpoint,
+    save_checkpoint,
+)
 
 
 def equal(a, b):
-    return all(
-        np.array_equal(x, y) for x, y in zip(jax.tree.leaves(a), jax.tree.leaves(b))
-    )
+    x, xt = jax.tree.flatten(a)
+    y, yt = jax.tree.flatten(b)
+    return xt == yt and all(np.array_equal(i, j) for i, j in zip(x, y))
+
+
+class FakeEnv:
+    action_space = SimpleNamespace(shape=(2,))
+    observation_space = SimpleNamespace(shape=(6,))
+    spec = SimpleNamespace(max_episode_steps=3)
+    task_infos = ({"task_name": "test"},)
+    closed = False
+
+    @property
+    def unwrapped(self):
+        return self
+
+    def reset(self, **kwargs):
+        self.steps = 0
+        return np.zeros(6, np.float32), {"goal": np.ones(6, np.float32)}
+
+    def step(self, action):
+        self.steps += 1
+        return (
+            np.zeros(6, np.float32),
+            0,
+            False,
+            self.steps == 3,
+            {"success": self.steps == 2},
+        )
+
+    def close(self):
+        self.closed = True
 
 
 class BaselineTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.config = OmegaConf.to_container(
-            OmegaConf.load("configs/experiment/smoke.yaml"), resolve=True
-        )
-        cls.agent = CRAFTAgent.create(0, 6, 2, cls.config["agent"])
-        cls.dataset = OfflineDataset(synthetic_dataset(), 2)
-        cls.batch = cls.dataset.sample(4)
+        cls.config = load_config("configs/experiment/smoke.yaml")
+        cls.initial = CRAFTAgent.create(0, 6, 2, cls.config["agent"])
+        cls.batch = OfflineDataset(synthetic_dataset(), 2).sample(4)
 
-    def test_joint_update_and_reproducibility(self):
-        a, metrics = self.agent.update(self.batch)
-        b, _ = self.agent.update(self.batch)
-        self.assertTrue(equal(a, b))
-        self.assertTrue(all(np.isfinite(x) for x in metrics.values()))
-        for before, after in [
-            (self.agent.critic, a.critic),
-            (self.agent.teacher, a.teacher),
-            (self.agent.actor, a.actor),
-        ]:
-            self.assertFalse(equal(before.params, after.params))
-        action = a.sample_action_chunk(
-            self.batch["observations"], self.batch["actor_goals"], jax.random.PRNGKey(1)
-        )
-        self.assertEqual(action.shape, (4, 2, 2))
-        self.assertTrue(np.all(np.isfinite(action)))
-        self.assertTrue(np.all(np.abs(action) <= 1))
+    def setUp(self):
+        self.agent = nnx.clone(self.initial)
 
-    def test_other_dimensions_and_single_action(self):
-        config = {**self.config["agent"], "chunk_length": 1}
-        agent = CRAFTAgent.create(7, 10, 3, config)
-        data = OfflineDataset(
-            synthetic_dataset(7, observation_dim=10, action_dim=3), 1, 7
+    def test_joint_update_reproducibility_and_parameter_changes(self):
+        other = nnx.clone(self.agent)
+        before = pure_state(self.agent)
+        metrics = self.agent.update(self.batch)
+        other.update(self.batch)
+        self.assertTrue(equal(pure_state(self.agent), pure_state(other)))
+        self.assertTrue(all(np.isfinite(value) for value in metrics.values()))
+        for role in ("critic", "teacher", "actor"):
+            self.assertFalse(equal(before[role], pure_state(self.agent)[role]))
+        actions = self.agent.sample_action_chunk(
+            self.batch["observations"], self.batch["actor_goals"], jax.random.PRNGKey(4)
         )
-        batch = data.sample(3)
-        agent, info = agent.update(batch)
-        self.assertTrue(all(np.isfinite(value) for value in info.values()))
-        actions = agent.sample_action_chunk(
-            batch["observations"][0], batch["actor_goals"][0], jax.random.PRNGKey(2)
-        )
-        self.assertEqual(actions.shape, (1, 3))
+        self.assertEqual(actions.shape, (4, 2, 2))
+        self.assertTrue(np.isfinite(actions).all() and (np.abs(actions) <= 1).all())
 
     def test_stage_ownership(self):
-        rep, _ = self.agent.update(self.batch, stage="representation")
-        self.assertTrue(equal(rep.actor, self.agent.actor))
-        self.assertTrue(equal(rep.teacher, self.agent.teacher))
-        act, _ = self.agent.update(self.batch, stage="action")
-        self.assertTrue(equal(act.critic, self.agent.critic))
+        before = pure_state(self.agent)
+        self.agent.update(self.batch, stage="representation")
+        for key in ("teacher", "actor"):
+            self.assertTrue(equal(before[key], pure_state(self.agent)[key]))
+        critic = nnx.to_pure_dict(nnx.state(self.agent.critic))
+        self.agent.update(self.batch, stage="action")
+        self.assertTrue(equal(critic, nnx.to_pure_dict(nnx.state(self.agent.critic))))
+        self.assertEqual([int(o.step[...]) for o in self.agent.optimizers], [1, 1, 1])
 
-    def test_tokens_exchange_and_order(self):
-        c = self.agent.critic
-        b = self.batch
-        actions = jnp.asarray(b["action_chunks"])
-        phi, _ = c.apply_fn(
-            {"params": c.params}, b["observations"], actions, b["value_goals"]
+    def test_nonfinite_update_is_atomic(self):
+        before = pure_state(self.agent)
+        batch = {
+            **self.batch,
+            "observations": np.full_like(self.batch["observations"], np.nan),
+        }
+        metrics = self.agent.update(batch)
+        self.assertFalse(bool(metrics["numerics/finite"]))
+        self.assertTrue(equal(before, pure_state(self.agent)))
+
+    def test_loss_weight_and_gradient_scale(self):
+        other = nnx.clone(self.agent)
+        other.distillation_weight = self.agent.distillation_weight * 10
+        low = self.agent.update(self.batch)
+        high = other.update(self.batch)
+        np.testing.assert_allclose(
+            high["actor/distill_grad_norm"],
+            10 * low["actor/distill_grad_norm"],
+            rtol=1e-4,
         )
-        reversed_phi, _ = c.apply_fn(
-            {"params": c.params}, b["observations"], actions[:, ::-1], b["value_goals"]
+        np.testing.assert_allclose(
+            high["actor/q_grad_norm"], low["actor/q_grad_norm"], rtol=1e-5
         )
-        self.assertFalse(np.allclose(phi, reversed_phi))
-        jac = jax.jacrev(
-            lambda x: c.apply_fn(
-                {"params": c.params}, b["observations"], x, b["value_goals"]
-            )[0].sum()
-        )(actions)
-        self.assertTrue(np.all(np.linalg.norm(np.asarray(jac), axis=(0, 2)) > 0))
-        embedding = self.agent.embeddings(b["observations"], b["actor_goals"])
-
-        def actor_output(a):
-            return self.agent.actor.apply_fn(
-                {"params": self.agent.actor.params},
-                b["observations"],
-                b["actor_goals"],
-                embedding,
-                a,
-                jnp.zeros(4),
-            )
-
-        changed = actions.at[:, 0].add(0.5)
-        self.assertFalse(
-            np.allclose(actor_output(actions)[:, 1], actor_output(changed)[:, 1])
+        np.testing.assert_allclose(
+            low["actor/loss"],
+            low["actor/q_loss"] + low["actor/weighted_distillation"],
+            rtol=1e-5,
         )
 
-    def test_shared_ffn_and_periodic_exchange(self):
-        # Odd width also verifies removal of attention's head-divisibility rule.
-        net = TokenBackbone(width=7, depth=5, exchange_every=2)
-        state = jnp.ones((1, 6))
-        actions = jnp.asarray([[[0.2, -0.3], [0.7, 0.1]]])
-        variables = net.init(jax.random.PRNGKey(5), state, actions)
-        params = variables["params"]
-        exchanges = {key for key in params if key.startswith("token_contract_")}
+    def test_mixer_sharing_exchange_and_order(self):
+        net = TokenBackbone(
+            6, 2, 2, width=7, depth=5, exchange_every=2, rngs=nnx.Rngs(3)
+        )
         self.assertEqual(
-            exchanges, {"token_contract_1", "token_contract_3", "token_contract_4"}
+            [b.exchange for b in net.blocks], [False, True, False, True, True]
         )
-        self.assertEqual(params["expand_0"]["kernel"].shape, (7, 28))
-        self.assertEqual(params["token_expand_1"]["kernel"].shape, (3, 6))
-
-        def apply(a):
-            return net.apply(
-                variables,
-                state,
-                a,
-                capture_intermediates=lambda module, method: (
-                    module.name == "contract_0"
-                ),
-                mutable=["intermediates"],
-            )
-
-        first, features = apply(actions)
-        second, changed = apply(actions.at[:, 0].add(0.5))
-        before = features["intermediates"]["contract_0"]["__call__"][0]
-        after = changed["intermediates"]["contract_0"]["__call__"][0]
-        # Before exchange, changes stay local to action token 0 (position 1).
+        self.assertEqual(net.blocks[0].ffn.layers[0].kernel.shape, (7, 28))
+        self.assertEqual(net.blocks[1].token_mlp.layers[0].kernel.shape, (3, 6))
+        s = jnp.ones((1, 6))
+        a = jnp.array([[[0.2, -0.3], [0.7, 0.1]]])
+        changed = a.at[:, 0].add(0.5)
+        before = net.blocks[0].local(net.tokenize(s, a))
+        after = net.blocks[0].local(net.tokenize(s, changed))
         np.testing.assert_array_equal(before[:, [0, 2]], after[:, [0, 2]])
-        self.assertFalse(np.allclose(before[:, 1], after[:, 1]))
-        # After exchange, state and other action tokens receive the information.
-        self.assertFalse(np.allclose(first[:, 0], second[:, 0]))
-        self.assertFalse(np.allclose(first[:, 2], second[:, 2]))
+        self.assertFalse(np.allclose(net(s, a)[:, 0], net(s, changed)[:, 0]))
+        self.assertFalse(np.allclose(net(s, a)[:, 0], net(s, a[:, ::-1])[:, 0]))
+        phi = lambda actions: self.agent.critic(
+            self.batch["observations"], actions, self.batch["value_goals"]
+        )[0].sum()
+        grad = jax.grad(phi)(jnp.asarray(self.batch["action_chunks"]))
+        self.assertTrue((np.linalg.norm(grad, axis=(0, 2)) > 0).all())
 
-    def test_embedding_is_detached(self):
-        def loss(p):
-            a = self.agent.replace(critic=self.agent.critic.replace(params=p))
-            return a.embeddings(
-                self.batch["observations"], self.batch["actor_goals"]
-            ).sum()
+    def test_condition_is_detached_but_actor_uses_it(self):
+        s, g = self.batch["observations"], self.batch["actor_goals"]
+        grads = nnx.grad(lambda c: encode_condition(c, s, g).sum())(self.agent.critic)
+        self.assertTrue(all((np.asarray(v) == 0).all() for v in jax.tree.leaves(grads)))
+        embedding = encode_condition(self.agent.critic, s, g)
+        args = (self.batch["action_chunks"], jnp.zeros(4))
+        first = self.agent.actor(s, g, embedding, *args)
+        second = self.agent.actor(s, g, jnp.zeros_like(embedding), *args)
+        self.assertFalse(np.allclose(first, second))
 
-        grads = jax.grad(loss)(self.agent.critic.params)
-        self.assertTrue(all(np.all(np.asarray(g) == 0) for g in jax.tree.leaves(grads)))
+    def test_other_shapes(self):
+        config = {**self.config["agent"], "chunk_length": 1}
+        agent = CRAFTAgent.create(7, 10, 3, config)
+        batch = OfflineDataset(
+            synthetic_dataset(7, observation_dim=10, action_dim=3), 1
+        ).sample(3)
+        self.assertTrue(bool(agent.update(batch)["numerics/finite"]))
+        self.assertEqual(
+            agent.sample_action_chunk(
+                batch["observations"][0], batch["actor_goals"][0], jax.random.PRNGKey(1)
+            ).shape,
+            (1, 3),
+        )
 
-    def test_resume_exact_next_update_and_sampler(self):
-        a, _ = self.agent.update(self.batch)
-        with tempfile.TemporaryDirectory() as d:
-            path = Path(d) / "checkpoint.msgpack"
+    def test_checkpoint_exact_resume_and_incompatible_shape(self):
+        ds = OfflineDataset(synthetic_dataset(), 2)
+        self.agent.update(ds.sample(4))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "checkpoint.msgpack"
             save_checkpoint(
                 path,
-                agent=a,
-                run_state={"step": 1, "rng": self.dataset.rng.bit_generator.state},
+                agent=self.agent,
+                run_state={"sampler_rng": ds.rng.bit_generator.state},
             )
-            restored, state = restore_checkpoint(path, agent=self.agent)
-            self.assertTrue(equal(a, restored))
-            data = OfflineDataset(synthetic_dataset(), 2)
-            data.rng.bit_generator.state = state["rng"]
-            first, second = self.dataset.sample(4), data.sample(4)
-            self.assertTrue(equal(first, second))
-            next_a, _ = a.update(first)
-            next_b, _ = restored.update(second)
-            self.assertTrue(equal(next_a, next_b))
+            restored = nnx.clone(self.initial)
+            state = restore_checkpoint(path, agent=restored)
+            other_ds = OfflineDataset(synthetic_dataset(), 2, seed=9)
+            other_ds.rng.bit_generator.state = state["sampler_rng"]
+            b1, b2 = ds.sample(4), other_ds.sample(4)
+            self.assertTrue(equal(b1, b2))
+            self.agent.update(b1)
+            restored.update(b2)
+            self.assertTrue(equal(pure_state(self.agent), pure_state(restored)))
+            mismatch = CRAFTAgent.create(0, 7, 2, self.config["agent"])
+            before = pure_state(mismatch)
+            with self.assertRaisesRegex(ValueError, "paths, shapes, or dtypes"):
+                restore_checkpoint(path, agent=mismatch)
+            self.assertTrue(equal(before, pure_state(mismatch)))
+            broken = read_checkpoint(path)
+            broken["run_state"] = "invalid JSON"
+            snapshot = pure_state(restored)
+            with self.assertRaises(ValueError):
+                restore_checkpoint(path, agent=restored, payload=broken)
+            self.assertTrue(equal(snapshot, pure_state(restored)))
+            path.write_bytes(b"not a valid checkpoint")
+            with self.assertRaises(ValueError):
+                restore_checkpoint(path, agent=restored)
 
-    def test_no_cross_episode_chunks_or_goals(self):
-        s = np.array([[0], [1], [2], [100], [101], [102]], dtype=np.float32)
+    def test_episode_boundaries_and_fingerprint(self):
+        s = np.array([[0], [1], [2], [100], [101], [102]], np.float32)
         data = {
             "observations": s,
             "next_observations": s + 1,
@@ -179,46 +213,32 @@ class BaselineTests(unittest.TestCase):
             "terminals": np.array([0, 0, 1, 0, 0, 1]),
         }
         ds = OfflineDataset(data, 2)
-        b = ds.sample(200)
-        for k in ["value_goals", "actor_goals"]:
-            self.assertTrue(np.all(b[k] // 100 == b["observations"] // 100))
-            self.assertTrue(np.all(b[k] > b["observations"]))
-        self.assertTrue(np.allclose(np.diff(b["action_chunks"], axis=1), 1 / 200))
+        batch = ds.sample(200)
+        for key in ("value_goals", "actor_goals"):
+            np.testing.assert_array_equal(
+                batch[key] // 100, batch["observations"] // 100
+            )
+        np.testing.assert_allclose(
+            np.diff(batch["action_chunks"], axis=1), 1 / 200, atol=1e-7
+        )
+        first = ds.fingerprint()
+        data["actions"][0] += 0.1
+        self.assertNotEqual(first, ds.fingerprint())
+        data["observations"][0] = np.nan
+        with self.assertRaisesRegex(ValueError, "Nonfinite"):
+            OfflineDataset(data, 2)
 
-    def test_rollout_cache_resets(self):
-        class Env:
-            def __init__(self):
-                self.task_infos = [{"task_name": "test"}]
-
-            @property
-            def unwrapped(self):
-                return self
-
-            def reset(self, **kwargs):
-                self.steps = 0
-                return np.zeros(6), {"goal": np.ones(6)}
-
-            def step(self, action):
-                self.steps += 1
-                return (
-                    np.zeros(6),
-                    0,
-                    False,
-                    self.steps == 3,
-                    {"success": self.steps == 2},
-                )
-
+    def test_rollout_resets_and_rejects_invalid_actions(self):
         calls = []
 
         def act(s, g, rng):
             calls.append(np.asarray(rng))
             return np.zeros((2, 2))
 
-        metrics = evaluate_rollouts(act, Env(), episodes=2, execution_length=2)
+        metrics = evaluate_rollouts(act, FakeEnv(), episodes=2, execution_length=2)
         self.assertEqual(len(calls), 4)
         self.assertEqual(metrics["evaluation/overall_success"], 1)
-        self.assertFalse(np.array_equal(calls[0], calls[1]))
-
-
-if __name__ == "__main__":
-    unittest.main()
+        with self.assertRaisesRegex(ValueError, "invalid/nonfinite"):
+            evaluate_rollouts(lambda *a: np.full((2, 2), np.nan), FakeEnv())
+        with self.assertRaisesRegex(ValueError, "Invalid evaluation task"):
+            evaluate_rollouts(act, FakeEnv(), task_ids=[2])

@@ -1,17 +1,18 @@
-"""Minimal Linen example; the project-wide Linen/NNX choice remains open."""
+"""Small NNX MLP with explicit dimensions and eager initialization."""
 
-from flax import linen as nn
-from jax import Array
+from itertools import pairwise
+
+from flax import nnx
 
 
-class MLP(nn.Module):
-    """Map inputs [..., input_dim] to features [..., output_dim]."""
+class MLP(nnx.Module):
+    def __init__(self, input_dim, hidden_dims, output_dim, *, rngs):
+        dims = (input_dim, *hidden_dims, output_dim)
+        if any(type(dim) is not int or dim <= 0 for dim in dims):
+            raise ValueError("MLP dimensions must be positive integers")
+        self.layers = nnx.List([nnx.Linear(a, b, rngs=rngs) for a, b in pairwise(dims)])
 
-    hidden_dims: tuple[int, ...]
-    output_dim: int
-
-    @nn.compact
-    def __call__(self, inputs: Array) -> Array:
-        for width in self.hidden_dims:
-            inputs = nn.relu(nn.Dense(width)(inputs))
-        return nn.Dense(self.output_dim)(inputs)
+    def __call__(self, inputs):
+        for layer in self.layers[:-1]:
+            inputs = nnx.gelu(layer(inputs))
+        return self.layers[-1](inputs)

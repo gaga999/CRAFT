@@ -1,4 +1,5 @@
-# Candidate paper task; CPU performance has not been benchmarked.
+# CPU-sized candidate, not paper-equivalent capacity or a tuned learning result.
+# FQL weight 0.1 and discount 0.95 follow the reference get_config defaults.
 seed: 0
 output_dir: runs/cpu_cube
 agent:
@@ -9,14 +10,15 @@ agent:
   latent_dim: 128
   learning_rate: 0.0003
   flow_steps: 10
-  alpha: 10.0
+  max_grad_norm: 10.0
+  distillation_weight: 0.1
 data:
   name: cube-double-play-v0
-  directory: ~/.ogbench/data
+  directory: data/ogbench
   path: null
   synthetic: false
   batch_size: 256
-  discount: 0.99
+  discount: 0.95
 train:
   stages:
     - name: joint

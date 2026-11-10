@@ -2,117 +2,105 @@
 
 **Contrastive Representation for Action Flow and Temporal Abstraction**
 
-Offline goal-conditioned CRL with token-based action chunks and a representation-
-conditioned actor. This is an initial research baseline, not a reproduction claim.
-Online collection, image encoders, and discrete actions are not implemented.
+Offline goal-conditioned CRL with MLP action tokens and an embedding-conditioned
+FQL actor. Standard vector-state, continuous-action OGBench datasets are supported;
+online collection, images, and discrete actions are not implemented.
 
 ## Quickstart
 
-Python 3.12+ and [uv](https://docs.astral.sh/uv/) are required. From this directory:
+Python 3.12+ and [uv](https://docs.astral.sh/uv/); OGBench is installed automatically.
 
 ```bash
 uv sync --locked
-uv run python scripts/train.py --config configs/experiment/smoke.yaml
+uv run craft --config configs/experiment/smoke.yaml output_dir=runs/smoke-new
 uv run python -m unittest discover -s tests -v
 uv run ruff check .
 
-# OGBench: downloads train/validation data on first use.
-uv sync --locked --extra ogbench
-uv run craft --config configs/experiment/offline.yaml
-# Override dataset, seed, or other settings with OmegaConf dotlist syntax:
-uv run craft --config configs/experiment/offline.yaml \
-  data.name=cube-single-play-v0 seed=1 output_dir=runs/cube-seed1
+# Requested CPU experiment; first use downloads about 257 MB of official data.
+JAX_PLATFORMS=cpu uv run craft --config configs/experiment/cpu_puzzle.yaml
+# Short plumbing check, preserving the full schedule for later resume:
+JAX_PLATFORMS=cpu uv run craft --config configs/experiment/cpu_puzzle.yaml \
+  --steps 3 output_dir=runs/puzzle-check data.batch_size=8 \
+  agent.width=32 agent.latent_dim=16 agent.depth=2 agent.flow_steps=2 \
+  train.log_interval=1 train.eval_interval=3 evaluation.episodes=1 \
+  'evaluation.task_ids=[1]'
 ```
 
-Use `--dry-run` to print settings without initializing components. The smoke config
-uses synthetic trajectories for three updates. It does not test control performance.
-Dataset/model dimensions are inferred from data; chunk length and network capacity
-are configurable. Supported inputs are OGBench's standard **vector-state,
-continuous-action, goal-conditioned** datasets (navigation and manipulation),
-with actions in `[-1, 1]`. Visual, discrete, oracle-representation, and single-task
-variants are outside this baseline's evaluation contract.
+`--dry-run` resolves and validates settings without side effects. Dotlist overrides
+are strict: unknown keys, invalid types, and nonfinite values fail early. CPU configs
+are capacity/budget choices, not tuned or paper-equivalent results. `--steps N`
+limits additional updates in this invocation; it does not change the saved schedule.
+
+## Runs, resume, evaluation
+
+New training **requires a nonexistent output directory**. Old files are never
+appended or overwritten. Resume validates config, dataset hashes, and checkpoint
+structure; code changes require an explicit `--allow-code-change` after inspection.
 
 ```bash
-# Resume using the exact saved configuration and optimizer/sampler states:
-uv run craft --config runs/crl_tokens/config.yaml \
-  --restore runs/crl_tokens/checkpoint.msgpack
-uv run python scripts/evaluate.py --config runs/crl_tokens/config.yaml \
-  --restore runs/crl_tokens/checkpoint.msgpack
-# Optional W&B logging (set WANDB_MODE=offline for local-only use):
-uv run craft --config configs/experiment/offline.yaml logging.backend=wandb
+uv run craft --config runs/cpu_puzzle/config.yaml \
+  --restore runs/cpu_puzzle/checkpoint.msgpack
+uv run python scripts/evaluate.py --config runs/cpu_puzzle/config.yaml \
+  --restore runs/cpu_puzzle/checkpoint.msgpack evaluation.episodes=20
 ```
 
-Checkpoints contain agent/optimizer/RNG states and sampler states; resolved config,
-revision/dirty status, package versions, and JSONL metrics are saved in `output_dir`.
-Use separate output directories per experiment. Resume currently requires an
-identical resolved config, including the original stage schedule. CUDA-enabled
-Linux installations can add `--extra cuda` to `uv sync`.
+Resume writes a fresh `sessions/resume-*/` under the original run; its checkpoint
+path is printed on exit. Evaluation loads only the environment and writes to a fresh
+sibling `evaluations/` directory; `--output-dir PATH` can select another fresh location
+outside the source run. It may override evaluation/logging settings. Neither mode
+rewrites the original config, metadata, metrics, or checkpoint.
 
-## Packages
-
-| Package | Role |
-| --- | --- |
-| JAX / Flax Linen | Autodiff, JIT, PRNG, models, and functional training state |
-| Optax | Adam, gradient clipping, and sigmoid contrastive loss |
-| NumPy | Episode-safe sampling and host-side dataset processing |
-| OmegaConf | YAML configuration and command-line overrides |
-| W&B | Optional tracking; console and JSONL work independently |
-| OGBench (extra) | Dataset loading, simulation, and goal-conditioned tasks |
-| uv / Ruff / unittest | Dependencies, linting, and numerical/contract checks |
+Each session stores resolved config, code/dependency snapshot, environment metadata,
+JSONL metrics, status, and dataset hashes. Training checkpoints include parameters,
+optimizers, step, and training/validation RNG. `Ctrl-C` saves the latest accepted
+update; hard termination relies on the last periodic checkpoint. NNX checkpoint
+format v2 cannot load older Linen checkpoints. To enable W&B, set
+`logging.backend=wandb`; `WANDB_MODE=offline` keeps tracking local. Each session has
+its own W&B run and one merged metrics record per logged step.
 
 ## Architecture
 
+**Flax NNX** owns model graphs, parameters, optimizers, and in-place JIT updates;
+there is no Linen/TrainState layer. All gradients are computed from pre-update
+weights, and nonfinite updates are rejected atomically.
+
 ```text
-scripts + config -> trainer -> dataset.sample -> agent.update
-                                                 | critic + teacher + student
-raw state + action tokens -> MLP mixer -> phi --+--> contrastive score
-future goal -> encoder -> projection -> psi ------+
-raw state/goal + detached encoder features
-  + noisy action tokens + time -> MLP mixer teacher / one-step actor -> chunk
-agent's current inference -> evaluator -> OGBench environment
+CLI/config -> experiment services -> trainer -> data.sample -> agent.update
+state + ordered action tokens -> shared FFNs / periodic MLP exchange -> phi
+future goal -> encoder / projection -> psi -> binary contrastive score
+state + goal + detached encoder features + noise -> chunk policy -> actions
+checkpoint + environment -> evaluator -> independent evaluation session
 ```
 
-Each critic sees one state token and one token per action with learned positions.
-Each layer applies an FFN shared across token positions. Every `exchange_every`
-layers (and at the final layer), a residual token-mixing MLP exchanges information
-across positions, with weights shared across channels. The chunk remains tokenized.
-Two critics use dot-product scores scaled by `sqrt(latent_dim)` and
-binary NCE. Their goal encoder is shared; interaction backbones and score heads
-are separate. The actor consumes raw state/goal and detached state/goal features
-from this learned encoder, before its contrastive projection head.
+FFN weights are shared across tokens, with independent parameters per layer.
+`exchange_every` controls token mixing; the final layer also exchanges information.
+Two critic heads share the goal encoder. Flow teacher and one-step actor are separate
+NNX policies. `joint`, `representation`, and `action` stages retain separate optimizer
+states. [Method/config rationale](docs/baseline.md) and [contracts](docs/interfaces.md).
 
-Following the reference's FQL branch, a flow teacher learns behavior matching, and
-a one-step stochastic actor maximizes the minimum critic score with teacher
-matching regularization. Both use the same token architecture with independent
-parameters. This baseline generates actions directly; latent action generation
-remains a research extension. See [method details and references](docs/baseline.md).
-
-## Structure and responsibilities
-
-| Path | Responsibility |
+| Location | Responsibility |
 | --- | --- |
-| `configs/experiment/` | Offline defaults and synthetic smoke settings |
-| `scripts/train.py`, `scripts/evaluate.py` | Thin command launchers |
-| `src/craft/cli.py` | Config, component assembly, scheduled runtime services |
-| `models/tokens.py` | Token interaction, critic encoder/heads, actor networks |
-| `models/mlp.py`, `models/factory.py` | Standalone MLP example and model construction |
-| `losses/contrastive.py` | Binary NCE and paired critic scores |
-| `agents/craft.py` | Initialization, stage-specific updates, train state, inference |
-| `policies/latent_chunk.py` | Bound inference facade (legacy name; direct-action baseline) |
-| `data/offline.py` | Full-chunk and future-goal sampling without crossing episodes |
-| `envs/factory.py` | Official OGBench loader and shape validation |
-| `trainers/offline.py` | Multi-stage iteration, resume position, callbacks |
-| `evaluators/rollout.py` | Per-task success, episode-local chunk execution/replanning |
-| `utils/` | Console/W&B logging and atomic Flax checkpoint persistence |
-| `tests/test_baseline.py` | Gradients, token order, stages, resume, sampling, rollout |
-| `docs/` | Research plan, method decisions, and interface contracts |
+| `config.py`, `cli.py` | Strict schema and thin entry points |
+| `experiments.py`, `utils/` | Assembly, isolated sessions, logging, checkpoints |
+| `models/`, `policies/` | NNX encoders/mixers and action-generation composition |
+| `agents/`, `losses/` | Gradient ownership, optimizer updates, objectives |
+| `data/`, `envs/` | Episode-safe sampling and official OGBench adapters |
+| `trainers/`, `evaluators/` | Scheduling, resume position, task rollouts |
+| `configs/experiment/`, `tests/` | Experiment settings and regression/numerical checks |
 
-Source paths in the table are relative to `src/craft/` where applicable. Modules
-follow documented role contracts without mandatory base classes. Stages are
-`joint` (default), `representation` (critic only), or `action` (teacher/actor only).
-The same agent retains optimizer states across stage changes. Future online work
-can reuse agent updates and inference while adding interaction and replay insertion.
+Source locations are relative to `src/craft/`. Core packages: JAX, Flax NNX, Optax,
+NumPy, OmegaConf, OGBench, and W&B; uv/Ruff/unittest support development.
 
-Mixer defaults: `depth=4`, `exchange_every=2`. FFNs share weights across tokens,
-not across layers. Token mixing depends on the configured chunk length. Previous
-attention-model checkpoints are incompatible; start a new run/output directory.
+## Devices
+
+```bash
+# Supported NVIDIA Linux machine; keep the extra on subsequent uv run commands.
+uv sync --locked --extra cuda
+CUDA_VISIBLE_DEVICES=0 JAX_PLATFORMS=cuda uv run --extra cuda craft \
+  --config configs/experiment/cpu_puzzle.yaml output_dir=runs/gpu-puzzle
+uv run python -c "import jax; print(jax.default_backend(), jax.devices())"
+```
+
+The CUDA 13 extra needs a compatible NVIDIA driver/GPU; see [JAX requirements](https://docs.jax.dev/en/latest/installation.html#nvidia-gpu).
+It does not enable Apple GPU acceleration. Training uses one device; select CPU
+with `JAX_PLATFORMS=cpu` before Python starts.

@@ -1,29 +1,17 @@
-"""Explicit model construction; no automatic imports or base class required."""
+"""Explicit construction of role-compatible, initialized NNX components."""
 
-from collections.abc import Mapping
-from typing import Any
+from flax import nnx
 
-from craft.models.mlp import MLP
-
-
-def make_encoder(config: Mapping[str, Any]) -> MLP:
-    """Construct an encoder module; initialize its variables in the agent."""
-    if config["name"] != "mlp":
-        raise ValueError(f"Unknown encoder: {config['name']!r}")
-    hidden_dims = tuple(config["hidden_dims"])
-    output_dim = config["output_dim"]
-    if any(width <= 0 for width in (*hidden_dims, output_dim)):
-        raise ValueError("Model dimensions must be positive")
-    return MLP(hidden_dims=hidden_dims, output_dim=output_dim)
+from craft.models.tokens import TokenCritic
+from craft.policies.chunk import ChunkPolicy
 
 
-def make_crl_models(config, action_dim):
-    """Construct compatible token critic and actor definitions (no state)."""
-    from craft.models.tokens import TokenActor, TokenCritic
-
-    width, depth, exchange_every, latent = [
-        int(config[key]) for key in ("width", "depth", "exchange_every", "latent_dim")
-    ]
-    return TokenCritic(width, depth, exchange_every, latent), TokenActor(
-        action_dim, width, depth, exchange_every
+def make_crl_models(config, observation_dim, action_dim, seed):
+    common = {key: config[key] for key in ("width", "depth", "exchange_every")}
+    dims = (observation_dim, action_dim, config["chunk_length"])
+    critic = TokenCritic(
+        *dims, **common, latent_dim=config["latent_dim"], rngs=nnx.Rngs(seed)
     )
+    teacher = ChunkPolicy(*dims, **common, rngs=nnx.Rngs(seed + 1))
+    actor = ChunkPolicy(*dims, **common, rngs=nnx.Rngs(seed + 2))
+    return critic, teacher, actor
