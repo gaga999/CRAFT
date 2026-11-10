@@ -1,55 +1,38 @@
-# Module contracts
+# Component contracts
 
-These are initial conventions, not mandatory base classes. Keep signatures, shapes,
-state ownership, and focused checks aligned when adding an implementation. Research
-choices remain in [project-plan.md](project-plan.md).
+Interfaces are role conventions with executable checks, not mandatory base classes.
+The current models use Flax Linen and functional PyTree training state.
 
-## Data and models
+- `OfflineDataset.sample(B)` returns float32 `observations [B,O]`,
+  `action_chunks [B,H,A]`, `value_goals [B,O]`, and `actor_goals [B,O]`.
+  `B >= 2`; chunks are complete and episode-safe. Sampling RNG is source-owned.
+- `TokenBackbone(state, actions, condition)` returns `[B,H+1,width]`. The first
+  token is state and subsequent tokens are ordered actions. Each layer shares one
+  channel FFN across tokens; exchange layers use a token MLP shared across channels.
+  `exchange_every >= 1` controls exchange frequency, with a final exchange always
+  included. No attention, dropout, or mutable batch statistics are used.
+- `TokenCritic` returns `phi, psi`, each `[2,B,latent_dim]`. `encode(states)` returns
+  pre-projection features `[B,width]`; actor conditions use these with stop-gradient.
+- `TokenActor(state, goal, embeddings, noisy_actions, time)` returns `[B,H,A]`.
+  Teacher output is velocity; student output is directly clipped action proposals.
+- `CRAFTAgent.update(batch, stage=...) -> (new_agent, metrics)` owns gradient paths
+  and optimizer steps. Stages are static JIT arguments. `representation` updates
+  critic only; `action` updates teacher/student only; `joint` updates all three.
+- `agent.sample_action_chunk(observations, goals, rng)` supports `[O]` or `[B,O]`
+  and returns `[H,A]` or `[B,H,A]`. Caller supplies a fresh RNG key. Bound policy
+  facades must be recreated after agent updates to avoid stale parameters.
+- `train_offline` controls stage order and calls `on_step(global_step, stage,
+  current_agent, metrics)`. `start_step` skips already-completed steps. The CLI
+  assembles components and schedules logging/evaluation/checkpoint callbacks.
+- Evaluators consume an inference callable and own per-episode chunk caching.
+  The offline trainer never needs model internals or loss formulas.
+- Checkpoints use Flax msgpack plus JSON run metadata. Restoration requires a
+  matching initialized agent template (including architecture and optimizer).
 
-- A data source exposes `sample(batch_size) -> Batch`. The initial offline source
-  owns its sampling RNG. A future replay buffer can share this sampling interface;
-  online collection and insertion require additional APIs.
-- Proposed state-based batch fields: `observations [B, O]`, `goals [B, G]`,
-  `action_chunks [B, H, A]`, and `chunk_mask [B, H]` when chunks are padded.
-  Define required fields for each stage before implementing it. Split trajectories
-  before forming overlapping chunks and never cross episode boundaries.
-- An encoder maps `[..., O] -> [..., Z]`. Interchangeable implementations must
-  agree on input structure, output dimension, dtype, and RNG/state behavior.
-- `models/mlp.py` uses Flax Linen solely as an executable example. Linen versus
-  NNX for the full method is undecided. With Linen, factories return uninitialized
-  modules; the agent owns initialized variables and optimizer states.
-- `losses/reconstruction.py` is an equal-shape MSE example for fully valid chunks.
-  It is not the CRAFT objective and does not handle masked/padded chunks.
-
-## Agent, policy, and stages
-
-- `agent.update(batch, stage=...) -> (new_agent, metrics)` owns losses, optimizer
-  steps, frozen/shared parameter decisions, target updates, and training RNG.
-  Stage dispatch happens outside JIT. The example dataclass is not a registered
-  JAX PyTree; choose the state representation before compiling updates.
-- One agent may have multiple stages. Define stage-specific batches, parameter
-  sharing, optimizer creation/reset, and freeze behavior in the concrete agent.
-- The policy composes models and receives current parameters explicitly through
-  `sample_action_chunk(params, observations, goals, rng) -> [B, H, A]`.
-  It does not own a second copy of trainable parameters.
-- Bind current agent parameters into an inference callable before evaluation.
-  A future execution adapter must track each environment's cached chunk, reset it
-  on episode boundaries, and replan after `execution_length` actions.
-- The trainer chooses stages/data and schedules callbacks; it does not choose loss
-  formulas or gradient paths. Its example callback receives a global step, stage,
-  current agent, and metrics. Logging, evaluation, and persistence are not wired yet.
-- Resume support must restore stage and local/global step, parameters, optimizer
-  and target states, agent/sampler RNG, plus configuration and code metadata.
-
-## Adding components
-
-1. Read the relevant role contract and the closest example.
-2. Implement the component in its role directory; use a base class only when shared
-   behavior requires it. Optional `Protocol` types can be added as interfaces settle.
-3. Register selectable model implementations explicitly in `models/factory.py`.
-4. Add configuration and verify shapes, finite outputs, RNG/state behavior, and
-   compatibility with the consuming policy or agent. Learning updates additionally
-   require gradient/update checks and a training smoke test.
-
-Future online support should add an interaction loop and replay insertion, while
-reusing policy inference, compatible batches, and agent updates. It is not implemented.
+To add a model, document its shapes/state/RNG behavior, implement it in `models/`,
+and expose construction through a factory or agent assembly. Verify shapes, token
+interaction, finite gradients, and downstream parameter updates. To add an agent,
+implement the update/inference contracts and add a runnable smoke configuration.
+See [baseline decisions](baseline.md) for objectives and [project plan](project-plan.md)
+for research scope. Online support needs collection/replay insertion in addition
+to the existing sampling contract.

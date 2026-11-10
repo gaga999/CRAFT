@@ -1,0 +1,32 @@
+# Candidate paper task; CPU performance has not been benchmarked.
+seed: 0
+output_dir: runs/cpu_cube
+agent:
+  chunk_length: 4
+  width: 128
+  depth: 4
+  exchange_every: 2
+  latent_dim: 128
+  learning_rate: 0.0003
+  flow_steps: 10
+  alpha: 10.0
+data:
+  name: cube-double-play-v0
+  directory: ~/.ogbench/data
+  path: null
+  synthetic: false
+  batch_size: 256
+  discount: 0.99
+train:
+  stages:
+    - name: joint
+      steps: 100000
+  log_interval: 100
+  eval_interval: 5000
+  save_interval: 5000
+evaluation:
+  episodes: 2
+  execution_length: 1
+logging:
+  backend: wandb
+  project: craft

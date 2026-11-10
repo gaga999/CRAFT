@@ -1,4 +1,4 @@
-"""Evaluation entry point; currently supports configuration inspection only."""
+"""Evaluate a saved CRAFT checkpoint on OGBench tasks."""
 
 from craft.cli import evaluate_main
 

@@ -1,23 +1,14 @@
-"""Illustrate a policy that composes multiple models to generate chunks."""
+"""Bind the current agent to a parameter-consistent inference interface."""
 
 from dataclasses import dataclass
 from typing import Any
 
-from jax import Array
-
 
 @dataclass(frozen=True)
 class LatentChunkPolicy:
-    """Inference logic only; the agent owns parameters and training state."""
+    """Compatibility facade; this baseline generates actions, not action latents."""
 
-    encoder: Any
-    generator: Any
-    decoder: Any
+    agent: Any
 
-    def sample_action_chunk(
-        self, params: Any, observations: Array, goals: Array, rng: Array
-    ) -> Array:
-        """Return [B, H, A]; supply a fresh RNG key for each call."""
-        raise NotImplementedError(
-            "Implement observation/goal encoding, latent generation, and decoding."
-        )
+    def sample_action_chunk(self, observations, goals, rng):
+        return self.agent.sample_action_chunk(observations, goals, rng)

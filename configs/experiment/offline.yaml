@@ -1,31 +1,31 @@
-# Illustrative configuration, not a finalized research protocol.
 seed: 0
+output_dir: runs/crl_tokens
 agent:
-  name: craft
-models:
-  encoder:
-    name: mlp
-    hidden_dims: [256, 256]
-    output_dim: 128
-policy:
-  name: latent_chunk
-  chunk_length: 8
-  execution_length: 1
-  action_dim: 2  # Example only; obtain from the actual environment.
+  chunk_length: 4
+  width: 128
+  depth: 4
+  exchange_every: 2
+  latent_dim: 128
+  learning_rate: 0.0003
+  flow_steps: 10
+  alpha: 10.0
 data:
-  path: null  # Set when the dataset loader is implemented.
+  name: pointmaze-medium-navigate-v0
+  directory: ~/.ogbench/data
+  path: null
+  synthetic: false
   batch_size: 256
-env:
-  name: null  # Select the benchmark before implementing its adapter.
+  discount: 0.99
 train:
-  mode: offline
   stages:
-    - name: representation
-      steps: 100000
-    - name: action
-      steps: 200000
+    - name: joint
+      steps: 1000000
+  log_interval: 1000
+  eval_interval: 50000
+  save_interval: 50000
+evaluation:
+  episodes: 20
+  execution_length: 1
 logging:
-  backend: console  # W&B adapter is pending.
+  backend: console
   project: craft
-checkpoint:
-  directory: runs/checkpoints
