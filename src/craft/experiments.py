@@ -1,7 +1,6 @@
 """Experiment assembly; session-local services keep source runs immutable."""
 
 import json
-from copy import deepcopy
 from pathlib import Path
 
 from craft.agents.craft import CRAFTAgent
@@ -12,17 +11,17 @@ from craft.evaluators.rollout import evaluate_rollouts
 from craft.trainers.offline import train_offline
 from craft.utils.checkpoint import read_checkpoint, restore_checkpoint, save_checkpoint
 from craft.utils.logging import Logger
+from craft.utils.random import make_random_engines
 from craft.utils.runs import allocate_session, provenance, write_json
 
 
-def checkpoint_metadata(agent, config, data, val, identity, environment):
+def checkpoint_metadata(agent, config, training_engine, identity, environment):
     return {
         "step": int(agent.step[...]),
         "config": config,
         "dimensions": [agent.observation_dim, agent.action_dim],
         "dataset_identity": identity,
-        "sampler_rng": data.rng.bit_generator.state,
-        "validation_rng": None if val is None else val.rng.bit_generator.state,
+        "training_engine": training_engine.numpy_state(),
         "source_sha256": environment["source_sha256"],
     }
 
@@ -82,6 +81,7 @@ def run_experiment(
         raise ValueError(
             "--output-dir is evaluation-only; use output_dir=... for new training"
         )
+    training_engine, evaluation_engine = make_random_engines(config["seed"])
     env = logger = session = agent = data = val = None
     identity = None
     try:
@@ -97,16 +97,17 @@ def run_experiment(
         else:
             if config["data"]["synthetic"]:
                 data = OfflineDataset(
-                    synthetic_dataset(config["seed"]),
+                    synthetic_dataset(rng=training_engine.numpy("synthetic")),
                     config["agent"]["chunk_length"],
-                    config["seed"],
                     config["data"]["discount"],
+                    rng=training_engine.numpy("data"),
                 )
             else:
                 env, data, val = make_env_and_datasets(
                     config["data"]["name"],
                     chunk_length=config["agent"]["chunk_length"],
-                    seed=config["seed"],
+                    rng=training_engine.numpy("data"),
+                    validation_rng=training_engine.numpy("validation"),
                     discount=config["data"]["discount"],
                     dataset_dir=config["data"]["directory"],
                     dataset_path=config["data"]["path"],
@@ -127,17 +128,14 @@ def run_experiment(
             if any(task > available for task in config["evaluation"]["task_ids"]):
                 raise ValueError("evaluation.task_ids exceeds environment task count")
         agent = CRAFTAgent.create(
-            config["seed"], observation_dim, action_dim, config["agent"]
+            observation_dim, action_dim, config["agent"], rngs=training_engine.jax
         )
         if saved is not None:
             restored = restore_checkpoint(checkpoint, agent=agent, payload=payload)
             if restored != saved or int(agent.step[...]) != saved["step"]:
                 raise ValueError("Checkpoint metadata and agent step disagree")
             if not evaluate:
-                # Validate both RNG payloads before creating a writable resume session.
-                data.rng.bit_generator.state = deepcopy(saved["sampler_rng"])
-                if val is not None:
-                    val.rng.bit_generator.state = deepcopy(saved["validation_rng"])
+                training_engine.restore_numpy(saved["training_engine"])
             session = allocate_session(
                 config,
                 mode="evaluate" if evaluate else "resume",
@@ -156,7 +154,7 @@ def run_experiment(
             return evaluate_rollouts(
                 agent.sample_action_chunk,
                 env,
-                seed=config["seed"],
+                engine=evaluation_engine,
                 **config["evaluation"],
             )
 
@@ -172,7 +170,7 @@ def run_experiment(
                 session / "checkpoint.msgpack",
                 agent=agent,
                 run_state=checkpoint_metadata(
-                    agent, config, data, val, identity, environment
+                    agent, config, training_engine, identity, environment
                 ),
             )
 

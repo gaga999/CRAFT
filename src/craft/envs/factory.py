@@ -39,7 +39,8 @@ def make_env_and_datasets(
     name,
     *,
     chunk_length,
-    seed,
+    rng,
+    validation_rng,
     discount=0.95,
     dataset_dir="data/ogbench",
     dataset_path=None,
@@ -56,11 +57,11 @@ def make_env_and_datasets(
             dataset_only=True,
             cur_env=env,
         )
-        train = OfflineDataset(train, chunk_length, seed, discount)
+        train = OfflineDataset(train, chunk_length, discount, rng=rng)
         val = (
             None
             if val is None
-            else OfflineDataset(val, chunk_length, seed + 1, discount)
+            else OfflineDataset(val, chunk_length, discount, rng=validation_rng)
         )
         for source in (train, val):
             if source is not None and (

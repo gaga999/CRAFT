@@ -10,11 +10,19 @@ import jax
 import numpy as np
 from flax import nnx, serialization
 
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
+
+
+def _is_key(value):
+    return jax.dtypes.issubdtype(value.dtype, jax.dtypes.prng_key)
+
+
+def _serialize_array(value):
+    return jax.random.key_data(value) if _is_key(value) else value
 
 
 def pure_state(agent):
-    return nnx.to_pure_dict(nnx.state(agent))
+    return jax.tree.map(_serialize_array, nnx.to_pure_dict(nnx.state(agent)))
 
 
 def require_finite(tree):
@@ -48,7 +56,7 @@ def read_checkpoint(path):
     payload = serialization.msgpack_restore(raw)
     if not isinstance(payload, dict) or payload.get("format_version") != FORMAT_VERSION:
         raise ValueError(
-            "Unsupported checkpoint format; Linen checkpoints cannot resume NNX training"
+            "Unsupported checkpoint format; expected v3 with centralized RNG streams. Start a new run for older checkpoints."
         )
     if not isinstance(payload.get("agent"), dict) or not isinstance(
         payload.get("run_state"), str
@@ -79,5 +87,14 @@ def restore_checkpoint(path, *, agent, payload=None):
         raise ValueError(
             "Checkpoint state paths, shapes, or dtypes do not match this NNX agent"
         )
-    nnx.update(agent, jax.tree.map(jax.numpy.asarray, payload["agent"]))
+    template = nnx.to_pure_dict(nnx.state(agent))
+
+    def restore_array(expected, value):
+        if _is_key(expected):
+            return jax.random.wrap_key_data(
+                jax.numpy.asarray(value), impl=jax.random.key_impl(expected)
+            )
+        return jax.numpy.asarray(value)
+
+    nnx.update(agent, jax.tree.map(restore_array, template, payload["agent"]))
     return metadata

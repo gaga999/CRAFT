@@ -22,12 +22,28 @@ from craft.utils.checkpoint import (
     restore_checkpoint,
     save_checkpoint,
 )
+from craft.utils.random import make_random_engines
 
 
 def equal(a, b):
     x, xt = jax.tree.flatten(a)
     y, yt = jax.tree.flatten(b)
     return xt == yt and all(np.array_equal(i, j) for i, j in zip(x, y))
+
+
+def seeded_agent(seed, observation_dim, action_dim, config):
+    engine, _ = make_random_engines(seed)
+    return CRAFTAgent.create(observation_dim, action_dim, config, rngs=engine.jax)
+
+
+def seeded_source(seed=0, chunk_length=2, observation_dim=6, action_dim=2):
+    engine, _ = make_random_engines(seed)
+    raw = synthetic_dataset(
+        rng=engine.numpy("synthetic"),
+        observation_dim=observation_dim,
+        action_dim=action_dim,
+    )
+    return OfflineDataset(raw, chunk_length, rng=engine.numpy()), engine
 
 
 class FakeEnv:
@@ -63,8 +79,8 @@ class BaselineTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.config = load_config("configs/experiment/smoke.yaml")
-        cls.initial = CRAFTAgent.create(0, 6, 2, cls.config["agent"])
-        cls.batch = OfflineDataset(synthetic_dataset(), 2).sample(4)
+        cls.initial = seeded_agent(0, 6, 2, cls.config["agent"])
+        cls.batch = seeded_source()[0].sample(4)
 
     def setUp(self):
         self.agent = nnx.clone(self.initial)
@@ -158,10 +174,8 @@ class BaselineTests(unittest.TestCase):
 
     def test_other_shapes(self):
         config = {**self.config["agent"], "chunk_length": 1}
-        agent = CRAFTAgent.create(7, 10, 3, config)
-        batch = OfflineDataset(
-            synthetic_dataset(7, observation_dim=10, action_dim=3), 1
-        ).sample(3)
+        agent = seeded_agent(7, 10, 3, config)
+        batch = seeded_source(7, 1, observation_dim=10, action_dim=3)[0].sample(3)
         self.assertTrue(bool(agent.update(batch)["numerics/finite"]))
         self.assertEqual(
             agent.sample_action_chunk(
@@ -171,25 +185,25 @@ class BaselineTests(unittest.TestCase):
         )
 
     def test_checkpoint_exact_resume_and_incompatible_shape(self):
-        ds = OfflineDataset(synthetic_dataset(), 2)
+        ds, engine = seeded_source()
         self.agent.update(ds.sample(4))
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "checkpoint.msgpack"
             save_checkpoint(
                 path,
                 agent=self.agent,
-                run_state={"sampler_rng": ds.rng.bit_generator.state},
+                run_state={"engine": engine.numpy_state()},
             )
             restored = nnx.clone(self.initial)
             state = restore_checkpoint(path, agent=restored)
-            other_ds = OfflineDataset(synthetic_dataset(), 2, seed=9)
-            other_ds.rng.bit_generator.state = state["sampler_rng"]
+            other_ds, other_engine = seeded_source()
+            other_engine.restore_numpy(state["engine"])
             b1, b2 = ds.sample(4), other_ds.sample(4)
             self.assertTrue(equal(b1, b2))
             self.agent.update(b1)
             restored.update(b2)
             self.assertTrue(equal(pure_state(self.agent), pure_state(restored)))
-            mismatch = CRAFTAgent.create(0, 7, 2, self.config["agent"])
+            mismatch = seeded_agent(0, 7, 2, self.config["agent"])
             before = pure_state(mismatch)
             with self.assertRaisesRegex(ValueError, "paths, shapes, or dtypes"):
                 restore_checkpoint(path, agent=mismatch)
@@ -212,7 +226,7 @@ class BaselineTests(unittest.TestCase):
             "actions": s / 200,
             "terminals": np.array([0, 0, 1, 0, 0, 1]),
         }
-        ds = OfflineDataset(data, 2)
+        ds = OfflineDataset(data, 2, rng=make_random_engines(0)[0].numpy())
         batch = ds.sample(200)
         for key in ("value_goals", "actor_goals"):
             np.testing.assert_array_equal(
@@ -226,19 +240,31 @@ class BaselineTests(unittest.TestCase):
         self.assertNotEqual(first, ds.fingerprint())
         data["observations"][0] = np.nan
         with self.assertRaisesRegex(ValueError, "Nonfinite"):
-            OfflineDataset(data, 2)
+            OfflineDataset(data, 2, rng=make_random_engines(0)[0].numpy())
 
     def test_rollout_resets_and_rejects_invalid_actions(self):
         calls = []
 
         def act(s, g, rng):
-            calls.append(np.asarray(rng))
+            calls.append(np.asarray(jax.random.key_data(rng)))
             return np.zeros((2, 2))
 
-        metrics = evaluate_rollouts(act, FakeEnv(), episodes=2, execution_length=2)
+        metrics = evaluate_rollouts(
+            act,
+            FakeEnv(),
+            engine=make_random_engines(0)[1],
+            episodes=2,
+            execution_length=2,
+        )
         self.assertEqual(len(calls), 4)
         self.assertEqual(metrics["evaluation/overall_success"], 1)
         with self.assertRaisesRegex(ValueError, "invalid/nonfinite"):
-            evaluate_rollouts(lambda *a: np.full((2, 2), np.nan), FakeEnv())
+            evaluate_rollouts(
+                lambda *a: np.full((2, 2), np.nan),
+                FakeEnv(),
+                engine=make_random_engines(0)[1],
+            )
         with self.assertRaisesRegex(ValueError, "Invalid evaluation task"):
-            evaluate_rollouts(act, FakeEnv(), task_ids=[2])
+            evaluate_rollouts(
+                act, FakeEnv(), engine=make_random_engines(0)[1], task_ids=[2]
+            )

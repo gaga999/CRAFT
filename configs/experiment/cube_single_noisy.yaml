@@ -1,0 +1,34 @@
+# CPU-sized starting point, not a tuned result or paper-equivalent capacity.
+# Standard OGBench noisy dataset, not the reference's custom sigma=1 noise ablation.
+seed: 0
+output_dir: runs/cube_single_noisy
+agent:
+  chunk_length: 3
+  width: 128
+  depth: 4
+  exchange_every: 2
+  latent_dim: 128
+  learning_rate: 0.0003
+  flow_steps: 10
+  max_grad_norm: 10.0
+  distillation_weight: 0.1
+data:
+  name: cube-single-noisy-v0
+  directory: data/ogbench
+  path: null
+  synthetic: false
+  batch_size: 256
+  discount: 0.95
+train:
+  stages:
+    - name: joint
+      steps: 1000000
+  log_interval: 100
+  eval_interval: 10000
+  save_interval: 10000
+evaluation:
+  episodes: 10
+  execution_length: 1
+logging:
+  backend: console
+  project: craft

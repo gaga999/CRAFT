@@ -148,8 +148,8 @@ def load_config(path, overrides=()):
 def validate_config(config):
     validate_agent(config["agent"])
     positive_int(config["seed"], "seed", 0)
-    if config["seed"] > 2**32 - 4:
-        raise ValueError("seed must fit a uint32 initialization stream")
+    if config["seed"] >= 2**32:
+        raise ValueError("seed must be less than 2**32")
     positive_int(config["data"]["batch_size"], "data.batch_size", 2)
     finite_float(config["data"]["discount"], "data.discount")
     if config["data"]["discount"] >= 1:

@@ -17,9 +17,9 @@ def all_finite(tree):
 
 
 class CRAFTAgent(nnx.Module):
-    def __init__(self, seed, observation_dim, action_dim, config):
+    def __init__(self, observation_dim, action_dim, config, *, rngs):
         self.critic, self.teacher, self.actor = make_crl_models(
-            config, observation_dim, action_dim, seed
+            config, observation_dim, action_dim, rngs=rngs
         )
         self.observation_dim = observation_dim
         self.action_dim = action_dim
@@ -39,17 +39,17 @@ class CRAFTAgent(nnx.Module):
                 for model in (self.critic, self.teacher, self.actor)
             ]
         )
-        self.rng = nnx.Variable(jax.random.PRNGKey(seed + 3))
+        self.rngs = rngs
         self.step = nnx.Variable(jnp.array(0, jnp.int32))
 
     @classmethod
-    def create(cls, seed, observation_dim, action_dim, config):
+    def create(cls, observation_dim, action_dim, config, *, rngs):
         from craft.config import validate_agent
 
         validate_agent(config)
         if min(observation_dim, action_dim) <= 0:
             raise ValueError("Observation/action dimensions must be positive")
-        return cls(seed, observation_dim, action_dim, config)
+        return cls(observation_dim, action_dim, config, rngs=rngs)
 
     @partial(nnx.jit, static_argnames=("stage",))
     def update(self, batch, *, stage="joint"):
@@ -69,7 +69,8 @@ class CRAFTAgent(nnx.Module):
             grads.append(critic_grad)
             metrics.update(info)
             metrics["critic/grad_norm"] = optax.tree.norm(critic_grad)
-        rng, nk, tk, zk = jax.random.split(self.rng[...], 4)
+        previous_count = self.rngs.updates.count[...]
+        nk, tk, zk = jax.random.split(self.rngs.updates(), 3)
         if stage != "representation":
             goals = batch["actor_goals"]
             embedding = encode_condition(self.critic, s, goals)
@@ -93,7 +94,8 @@ class CRAFTAgent(nnx.Module):
                 proposed = jnp.clip(raw, -1, 1)
                 q = q_values(*self.critic(s, proposed, goals)).min(0)
                 qloss = -q.mean() / jax.lax.stop_gradient(jnp.abs(q).mean() + 1e-6)
-                distill = jnp.square(proposed - target).mean()
+                # Keep the recovery gradient when raw actions exceed the bounds.
+                distill = jnp.square(raw - target).mean()
                 return jnp.stack([qloss, self.distillation_weight * distill]), (
                     q.mean(),
                     distill,
@@ -133,10 +135,12 @@ class CRAFTAgent(nnx.Module):
             if stage != "representation":
                 agent.optimizers[1].update(agent.teacher, grads[index])
                 agent.optimizers[2].update(agent.actor, grads[index + 1])
-            agent.rng[...] = rng
             agent.step[...] += 1
 
-        nnx.cond(finite, commit, lambda agent: None, self)
+        def reject(agent):
+            agent.rngs.updates.count[...] = previous_count
+
+        nnx.cond(finite, commit, reject, self)
         return {**metrics, "numerics/finite": finite}
 
     @nnx.jit

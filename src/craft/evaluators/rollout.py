@@ -5,7 +5,7 @@ import numpy as np
 
 
 def evaluate_rollouts(
-    act, env, *, episodes=10, seed=0, execution_length=1, task_ids=()
+    act, env, *, engine, episodes=10, execution_length=1, task_ids=()
 ):
     if episodes <= 0 or execution_length <= 0:
         raise ValueError("Episodes and execution length must be positive")
@@ -23,10 +23,10 @@ def evaluate_rollouts(
         raise ValueError("Evaluation requires an environment time limit")
     for task_id in selected:
         successes = []
-        rng = jax.random.fold_in(jax.random.PRNGKey(seed), task_id)
+        rng = engine.task_key(task_id)
         for episode in range(episodes):
             observation, info = env.reset(
-                seed=seed + episode, options={"task_id": task_id}
+                seed=engine.episode_seed(task_id, episode), options={"task_id": task_id}
             )
             goal = info["goal"]
             if np.shape(goal) != np.shape(observation) or not np.isfinite(goal).all():

@@ -10,11 +10,9 @@ from unittest.mock import patch
 import numpy as np
 from flax import nnx
 from omegaconf.errors import OmegaConfBaseException
-from test_baseline import FakeEnv, equal
+from test_baseline import FakeEnv, equal, seeded_agent, seeded_source
 
-from craft.agents.craft import CRAFTAgent
 from craft.config import load_config
-from craft.data.offline import OfflineDataset, synthetic_dataset
 from craft.experiments import run_experiment
 from craft.utils.checkpoint import pure_state, read_checkpoint, restore_checkpoint
 from craft.utils.logging import Logger
@@ -80,7 +78,7 @@ class RuntimeTests(unittest.TestCase):
             c2 = deepcopy(c)
             c2["output_dir"] = str(Path(directory) / "whole")
             full = run_experiment(c2)
-            a = CRAFTAgent.create(0, 6, 2, c["agent"])
+            a = seeded_agent(0, 6, 2, c["agent"])
             b = nnx.clone(a)
             restore_checkpoint(resumed / "checkpoint.msgpack", agent=a)
             restore_checkpoint(full / "checkpoint.msgpack", agent=b)
@@ -102,7 +100,7 @@ class RuntimeTests(unittest.TestCase):
             meta["config"] = config
             from craft.utils.checkpoint import save_checkpoint
 
-            agent = CRAFTAgent.create(0, 6, 2, config["agent"])
+            agent = seeded_agent(0, 6, 2, config["agent"])
             restore_checkpoint(run / "checkpoint.msgpack", agent=agent)
             save_checkpoint(run / "checkpoint.msgpack", agent=agent, run_state=meta)
             before = snapshot(run)
@@ -142,7 +140,7 @@ class RuntimeTests(unittest.TestCase):
             invalid["agent"]["distillation_weight"] = 10
             with self.assertRaisesRegex(ValueError, "mismatch"):
                 run_experiment(invalid, checkpoint=run / "checkpoint.msgpack")
-            changed = synthetic_dataset()
+            changed = seeded_source()[0].data
             changed["actions"][0] += 0.1
             with (
                 patch("craft.experiments.synthetic_dataset", return_value=changed),
@@ -154,8 +152,8 @@ class RuntimeTests(unittest.TestCase):
     def test_interrupt_checkpoint_and_sampler_rollback(self):
         from craft.trainers.offline import train_offline
 
-        ds = OfflineDataset(synthetic_dataset(), 2)
-        agent = CRAFTAgent.create(
+        ds, _ = seeded_source()
+        agent = seeded_agent(
             0, 6, 2, load_config("configs/experiment/smoke.yaml")["agent"]
         )
         previous = deepcopy(ds.rng.bit_generator.state)

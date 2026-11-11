@@ -6,13 +6,13 @@ import numpy as np
 
 
 class OfflineDataset:
-    def __init__(self, data, chunk_length=1, seed=0, discount=0.95):
+    def __init__(self, data, chunk_length=1, discount=0.95, *, rng):
         if chunk_length < 1 or not 0 < discount < 1:
             raise ValueError("Require positive chunk length and discount in (0, 1)")
         self.data = data
         self.chunk_length = chunk_length
         self.discount = discount
-        self.rng = np.random.default_rng(seed)
+        self.rng = rng
         if not {"observations", "actions", "next_observations", "terminals"} <= set(
             data
         ):
@@ -81,9 +81,8 @@ class OfflineDataset:
         }
 
 
-def synthetic_dataset(seed=0, episodes=8, length=32, observation_dim=6, action_dim=2):
+def synthetic_dataset(*, rng, episodes=8, length=32, observation_dim=6, action_dim=2):
     """Small continuous trajectories for plumbing checks, not performance claims."""
-    rng = np.random.default_rng(seed)
     s = rng.normal(size=(episodes, length + 1, observation_dim)).astype(np.float32)
     a = rng.uniform(-1, 1, (episodes * length, action_dim)).astype(np.float32)
     terminals = np.zeros((episodes, length), np.float32)

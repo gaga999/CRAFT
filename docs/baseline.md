@@ -17,9 +17,14 @@ Critic interaction trunks are separate; their goal encoder is shared.
 The [FQL](https://arxiv.org/abs/2502.02538) teacher regresses `a-noise` along a linear
 noise/action interpolation. Euler integration supplies a detached teacher target.
 The student minimizes `-mean(Q)/stopgrad(mean(abs(Q))+1e-6)` plus
-`distillation_weight * MSE(student, teacher)`, with `Q=min(Q1,Q2)`. Actor conditions
+`distillation_weight * MSE(raw_student, teacher)`, with `Q=min(Q1,Q2)`. Actor conditions
 use raw state/goal and detached critic features. Critic parameters are fixed during
 actor differentiation, but gradients pass through critic inputs to actions.
+Distillation uses raw student outputs so out-of-bounds values retain a recovery
+gradient; only the Q input is clipped. Teacher targets are clipped after integration
+and detached, while velocities remain unbounded. Rollout sampling clips final
+actions. This follows [official FQL](https://github.com/seohongpark/fql/blob/master/agents/fql.py)
+and corrects the local CRL+AC branch's early clip before distillation.
 There is no TD target critic or reward bootstrap in this objective.
 
 ## Configuration rationale
@@ -29,14 +34,14 @@ There is no TD target critic or reward bootstrap in this objective.
 | Learning rate / flow steps | `3e-4` / `10`, reference `agents/accrl.py:get_config`. |
 | Distillation weight | `0.1`, reference code default; replaces the unsupported universal `alpha=10`. Reference README grids also use `1,3,10`: these are experiment-specific alternatives, not evidence that any value is optimal here. |
 | Discount | `0.95`, reference default; controls geometric future-goal offsets, not a TD backup. |
-| Puzzle chunk / execution | `3` / `1`. Chunk 3 follows the reference manipulation grid; one-step execution isolates extraction and differs from its full-chunk grid protocol. |
+| Cube/Puzzle chunk / execution | `3` / `1`. Chunk 3 follows the reference manipulation grid; one-step execution isolates extraction and differs from its full-chunk grid protocol. |
 | CPU capacity / batch | Width/latent 128, depth 4, batch 256 are CPU compromises; reference networks are substantially larger with batch 1024. No performance equivalence is claimed. |
 | Optimizer | Separate Adam states, global norm clipping at 10 (a configurable stability choice). |
 
 Log weighted losses, Q/distillation gradient norms and their ratio, saturation,
 representation norms/variation, and held-out discrimination. Gradient diagnostics
 add backward-pass cost; coefficients must be tuned using learning/evaluation data,
-not loss values alone. `cpu_puzzle.yaml` is a starting experiment; `smoke.yaml` only
+not loss values alone. `cube_single_noisy.yaml` and `cpu_puzzle.yaml` are starting experiments; `smoke.yaml` only
 tests plumbing. Full learning performance and the sole cause of earlier failed
 cube training remain unverified.
 
@@ -50,10 +55,14 @@ state differs from the compact reference sampler; match samplers for reproductio
 No observation normalization, frame stacking, augmentation, or random-goal mixture
 is silently added. Only standard vector-state/continuous-action datasets are supported.
 
-Use independent RNG for training, validation, and evaluation; task success is any
-success during an episode, averaged equally across selected tasks. A fresh session
+`make_random_engines(seed)` creates training/evaluation engines at entry and seeds
+legacy Python/NumPy APIs once. Explicit initialization/update/data/validation streams
+are independent; evaluation derives fixed per-task keys and per-episode environment
+seeds, so task order or evaluation cadence cannot advance training randomness.
+NumPy Generator states and typed JAX keys/counters are saved and restored.
+Task success is any success during an episode, averaged equally across selected tasks. A fresh session
 stores each evaluation/resume, with code/dependency snapshots and dataset hashes.
-Checkpoint format v2 is NNX-only. Exact resume is checked at accepted-update
-boundaries; diagnostics interrupted mid-callback can be absent from that session.
+Checkpoint format v3 requires the centralized RNG layout; v2 is rejected. Exact
+resume is checked at accepted-update boundaries; diagnostics interrupted mid-callback can be absent from that session.
 Multiple seeds, matched sampling/capacity/budgets, and learning curves are required
 before concluding that tokens, embeddings, or a particular coefficient help.
