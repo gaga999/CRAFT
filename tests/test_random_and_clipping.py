@@ -7,10 +7,8 @@ import tempfile
 import unittest
 from copy import deepcopy
 from pathlib import Path
-from unittest.mock import patch
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from flax import nnx, serialization
 from test_baseline import FakeEnv, equal, seeded_agent, seeded_source
@@ -18,12 +16,9 @@ from test_baseline import FakeEnv, equal, seeded_agent, seeded_source
 from craft.agents.craft import CRAFTAgent
 from craft.config import load_config
 from craft.evaluators.rollout import evaluate_rollouts
-from craft.policies.chunk import ChunkPolicy, encode_condition, integrate_flow
 from craft.utils.checkpoint import (
     pure_state,
     read_checkpoint,
-    restore_checkpoint,
-    save_checkpoint,
 )
 from craft.utils.random import make_random_engines
 
@@ -108,7 +103,7 @@ class EngineTests(unittest.TestCase):
         self.assertGreater(int(train.jax.params.count[...]), 0)
         self.assertEqual(int(train.jax.updates.count[...]), 0)
         self.assertFalse(
-            equal(pure_state(agent)["teacher"], pure_state(agent)["actor"])
+            equal(pure_state(agent)["posterior"], pure_state(agent)["prior"])
         )
         fresh = seeded_agent(8, 6, 2, config)
         self.assertTrue(equal(pure_state(agent), pure_state(fresh)))
@@ -182,97 +177,5 @@ class EngineTests(unittest.TestCase):
                     {"format_version": 2, "agent": {}, "run_state": "{}"}
                 )
             )
-            with self.assertRaisesRegex(ValueError, "expected v3"):
+            with self.assertRaisesRegex(ValueError, "expected v4"):
                 read_checkpoint(path)
-
-
-class ClippingTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.config = load_config("configs/experiment/smoke.yaml")["agent"]
-        cls.initial = seeded_agent(0, 6, 2, cls.config)
-        cls.batch = seeded_source()[0].sample(4)
-
-    def test_saturated_student_gets_recovery_gradient(self):
-        agent = nnx.clone(self.initial)
-        agent.actor.output.kernel[...] = jnp.zeros_like(agent.actor.output.kernel[...])
-        agent.actor.output.bias[...] = jnp.array([2.0, -2.0])
-        metrics = agent.update(self.batch, stage="action")
-        self.assertTrue(bool(metrics["numerics/finite"]))
-        self.assertEqual(float(metrics["actor/saturation"]), 1.0)
-        self.assertEqual(float(metrics["actor/q_grad_norm"]), 0.0)
-        self.assertGreater(float(metrics["actor/distill_grad_norm"]), 0.0)
-        bias = np.asarray(agent.actor.output.bias[...])
-        self.assertTrue(1 < bias[0] < 2)
-        self.assertTrue(-2 < bias[1] < -1)
-        # The old clipped-loss formula is a zero-gradient control in this case.
-        old_grad = jax.grad(lambda raw: jnp.square(jnp.clip(raw, -1, 1) - 0.5).mean())(
-            jnp.array([2.0, -2.0])
-        )
-        np.testing.assert_array_equal(old_grad, jnp.zeros(2))
-
-    def test_training_does_not_call_sample_and_inference_remains_bounded(self):
-        agent = nnx.clone(self.initial)
-        with patch.object(
-            ChunkPolicy, "sample", side_effect=AssertionError("update must not sample")
-        ):
-            self.assertTrue(bool(agent.update(self.batch)["numerics/finite"]))
-        agent.actor.output.kernel[...] = jnp.zeros_like(agent.actor.output.kernel[...])
-        agent.actor.output.bias[...] = jnp.array([2.0, -2.0])
-        s, g = self.batch["observations"], self.batch["actor_goals"]
-        raw = agent.actor(
-            s,
-            g,
-            encode_condition(agent.critic, s, g),
-            self.batch["action_chunks"],
-            jnp.zeros(4),
-        )
-        self.assertTrue((np.abs(raw) > 1).all())
-        key = make_random_engines(4)[1].task_key(1)
-        sampled = agent.sample_action_chunk(s, g, key)
-        np.testing.assert_array_equal(
-            sampled, np.broadcast_to([1.0, -1.0], sampled.shape)
-        )
-        # Sampling doesn't mutate the training state or its RNG counters.
-        before = pure_state(agent)
-        agent.sample_action_chunk(s, g, key)
-        self.assertTrue(equal(before, pure_state(agent)))
-
-    def test_teacher_velocity_unbounded_but_target_bounded(self):
-        agent = nnx.clone(self.initial)
-        agent.teacher.output.kernel[...] = jnp.zeros_like(
-            agent.teacher.output.kernel[...]
-        )
-        agent.teacher.output.bias[...] = jnp.array([4.0, -4.0])
-        s, g = self.batch["observations"], self.batch["actor_goals"]
-        h = encode_condition(agent.critic, s, g)
-        noise = jnp.zeros_like(self.batch["action_chunks"])
-        velocity = agent.teacher(s, g, h, noise, jnp.zeros(4))
-        self.assertTrue((np.abs(velocity) > 1).all())
-        target = integrate_flow(agent.teacher, s, g, h, noise, agent.flow_steps)
-        np.testing.assert_array_equal(
-            target, np.broadcast_to([1.0, -1.0], target.shape)
-        )
-        before = pure_state(agent)["teacher"]
-        self.assertTrue(
-            bool(agent.update(self.batch, stage="action")["numerics/finite"])
-        )
-        self.assertFalse(equal(before, pure_state(agent)["teacher"]))
-
-    def test_saturated_update_exact_resume_with_typed_keys(self):
-        agent = nnx.clone(self.initial)
-        agent.actor.output.bias[...] = jnp.array([2.0, -2.0])
-        agent.update(self.batch)
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "checkpoint.msgpack"
-            save_checkpoint(path, agent=agent, run_state={"step": 1})
-            restored = nnx.clone(self.initial)
-            restore_checkpoint(path, agent=restored)
-            self.assertTrue(
-                jax.dtypes.issubdtype(
-                    restored.rngs.updates.key.dtype, jax.dtypes.prng_key
-                )
-            )
-            agent.update(self.batch)
-            restored.update(self.batch)
-            self.assertTrue(equal(pure_state(agent), pure_state(restored)))

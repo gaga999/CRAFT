@@ -28,7 +28,7 @@ class ConfigTests(unittest.TestCase):
     def test_all_shipped_configs_and_coefficient(self):
         for path in Path("configs/experiment").glob("*.yaml"):
             config = load_config(path)
-            self.assertEqual(config["agent"]["distillation_weight"], 0.1)
+            self.assertEqual(config["agent"]["guide_weight"], 0.1)
             self.assertEqual(config["data"]["discount"], 0.95)
 
     def test_invalid_configs_fail_before_any_run(self):
@@ -36,7 +36,7 @@ class ConfigTests(unittest.TestCase):
             "agent.alpha=10",
             "agent.width=1.5",
             "agent.width=true",
-            "agent.distillation_weight=nan",
+            "agent.kl_weight=nan",
             "agent.learning_rate=inf",
             "agent.width=0",
             "data.discount=1",
@@ -65,9 +65,10 @@ class RuntimeTests(unittest.TestCase):
             c = self.config(directory)
             run = run_experiment(c, max_steps=1)
             before = snapshot(run)
-            with self.assertRaises(FileExistsError):
-                run_experiment(c)
+            repeated = run_experiment(c, max_steps=1)
+            self.assertNotEqual(run, repeated)
             self.assertEqual(before, snapshot(run))
+            c = load_config(run / "config.yaml")
             resumed = run_experiment(c, checkpoint=run / "checkpoint.msgpack")
             for path, content in before.items():
                 self.assertEqual((run / path).read_bytes(), content)
@@ -94,6 +95,7 @@ class RuntimeTests(unittest.TestCase):
             config = self.config(directory)
             run = run_experiment(config, max_steps=1)
             # A fake real adapter avoids downloading while exercising production orchestration.
+            config = load_config(run / "config.yaml")
             config["data"]["synthetic"] = False
             saved = read_checkpoint(run / "checkpoint.msgpack")
             meta = json.loads(saved["run_state"])
@@ -135,9 +137,10 @@ class RuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             c = self.config(directory)
             run = run_experiment(c, max_steps=1)
+            c = load_config(run / "config.yaml")
             before = snapshot(run)
             invalid = deepcopy(c)
-            invalid["agent"]["distillation_weight"] = 10
+            invalid["agent"]["guide_weight"] = 10
             with self.assertRaisesRegex(ValueError, "mismatch"):
                 run_experiment(invalid, checkpoint=run / "checkpoint.msgpack")
             changed = seeded_source()[0].data
@@ -182,9 +185,10 @@ class RuntimeTests(unittest.TestCase):
                 self.assertRaises(KeyboardInterrupt),
             ):
                 run_experiment(c)
-            status = json.loads((Path(c["output_dir"]) / "status.json").read_text())
+            actual = next(Path(directory).glob("run-*"))
+            status = json.loads((actual / "status.json").read_text())
             self.assertEqual(status, {"status": "interrupted", "step": 1})
-            self.assertTrue((Path(c["output_dir"]) / "checkpoint.msgpack").is_file())
+            self.assertTrue((actual / "checkpoint.msgpack").is_file())
 
     def test_logger_rejects_duplicate_steps_and_append(self):
         with tempfile.TemporaryDirectory() as directory:

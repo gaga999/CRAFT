@@ -130,40 +130,38 @@ class TokenCritic(nnx.Module):
         depth=4,
         exchange_every=2,
         latent_dim=128,
+        batch_size=256,
         rngs,
     ):
         self.goal_encoder = GoalEncoder(observation_dim, width, latent_dim, rngs=rngs)
-        self.backbones = nnx.List(
-            [
-                TokenBackbone(
-                    observation_dim,
-                    action_dim,
-                    chunk_length,
-                    width=width,
-                    depth=depth,
-                    exchange_every=exchange_every,
-                    rngs=rngs,
-                )
-                for _ in range(2)
-            ]
+        self.backbone = TokenBackbone(
+            observation_dim,
+            action_dim,
+            chunk_length,
+            width=width,
+            depth=depth,
+            exchange_every=exchange_every,
+            rngs=rngs,
         )
-        self.phi_heads = nnx.List(
-            [nnx.Linear(width, latent_dim, rngs=rngs) for _ in range(2)]
-        )
-        self.psi_heads = nnx.List(
-            [nnx.Linear(latent_dim, latent_dim, rngs=rngs) for _ in range(2)]
-        )
+        self.phi_head = MLP(width, (width,), latent_dim, rngs=rngs)
+        self.log_scale = nnx.Param(jnp.log(jnp.array(10.0, jnp.float32)))
+        self.bias = nnx.Param(-jnp.log(jnp.array(batch_size - 1.0, jnp.float32)))
 
     def encode(self, states):
         return self.goal_encoder.encode(states)
 
+    def features(self, states, actions):
+        return self.backbone(states, actions)
+
     def __call__(self, states, actions, goals):
-        _, z = self.goal_encoder(goals)
-        phi = jnp.stack(
-            [
-                head(nnx.gelu(net(states, actions)[:, 0]))
-                for net, head in zip(self.backbones, self.phi_heads)
-            ]
-        )
-        psi = jnp.stack([head(z) for head in self.psi_heads])
-        return phi, psi
+        phi = self.phi_head(self.features(states, actions).mean(axis=1))
+        _, psi = self.goal_encoder(goals)
+
+        def unit(x):
+            return x / jnp.sqrt(jnp.sum(x * x, axis=-1, keepdims=True) + 1e-8)
+
+        return unit(phi), unit(psi)
+
+    def score(self, states, actions, goals):
+        phi, psi = self(states, actions, goals)
+        return (phi * psi).sum(-1)

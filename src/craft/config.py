@@ -9,14 +9,22 @@ from omegaconf import OmegaConf
 
 @dataclass
 class AgentConfig:
-    chunk_length: int = 3
+    chunk_length: int = 5
     width: int = 128
     depth: int = 4
     exchange_every: int = 2
     latent_dim: int = 128
     learning_rate: float = 0.0003
-    flow_steps: int = 10
-    distillation_weight: float = 0.1
+    vae_latent_dim: int = 16
+    fusion_depth: int = 2
+    prior_learning_rate: float = 0.0001
+    kl_weight: float = 0.01
+    guide_weight: float = 0.1
+    guidance_enabled: bool = True
+    cvae_updates_crl: bool = False
+    condition_drop_prob: float = 0.2
+    log_std_min: float = -4.0
+    log_std_max: float = 1.0
     max_grad_norm: float = 10.0
 
 
@@ -88,7 +96,7 @@ def validate_agent(config):
     expected = set(OmegaConf.to_container(OmegaConf.structured(AgentConfig)))
     if set(config) != expected:
         raise ValueError(
-            f"Agent configuration keys differ: {set(config) ^ expected}. Use distillation_weight, not alpha."
+            f"Agent configuration keys differ: {set(config) ^ expected}. Use the CVAE POC schema; FQL configs are incompatible."
         )
     for key in (
         "chunk_length",
@@ -96,14 +104,25 @@ def validate_agent(config):
         "depth",
         "exchange_every",
         "latent_dim",
-        "flow_steps",
+        "vae_latent_dim",
+        "fusion_depth",
     ):
         positive_int(config[key], f"agent.{key}")
-    for key in ("learning_rate", "max_grad_norm"):
+    for key in ("learning_rate", "prior_learning_rate", "max_grad_norm"):
         finite_float(config[key], f"agent.{key}")
-    finite_float(
-        config["distillation_weight"], "agent.distillation_weight", strict=False
-    )
+    for key in ("kl_weight", "guide_weight", "condition_drop_prob"):
+        finite_float(config[key], key, strict=False)
+    if config["condition_drop_prob"] > 1:
+        raise ValueError("condition_drop_prob must be <= 1")
+    if (
+        not math.isfinite(config["log_std_min"])
+        or not math.isfinite(config["log_std_max"])
+        or not -10 <= config["log_std_min"] < 0 < config["log_std_max"] <= 3
+    ):
+        raise ValueError("log_std bounds must be finite: -10 <= min < 0 < max <= 3")
+    for key in ("guidance_enabled", "cvae_updates_crl"):
+        if type(config[key]) is not bool:
+            raise ValueError(f"{key} must be boolean")
 
 
 def load_config(path, overrides=()):

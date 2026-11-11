@@ -1,24 +1,16 @@
-# Contracts
+# POC contracts
 
-Interfaces are documented roles, without mandatory base classes. Components use
-Flax NNX with eager initialization and explicit dimensions.
-
-| Component | Contract |
-| --- | --- |
-| Data source | `sample(B)` returns float32 `observations [B,O]`, `action_chunks [B,H,A]`, `value_goals [B,O]`, `actor_goals [B,O]`; `B>=2`. Receives a NumPy stream from the training engine. |
-| Token backbone | `[B,O]`, `[B,H,A]`, optional condition → `[B,H+1,width]`. Shared channel FFNs; periodic token MLPs; ordered positions. |
-| Critic | `(state, chunk, goal) → phi, psi`, each `[2,B,D]`. `encode(state) → [B,width]` precedes contrastive projection. |
-| Chunk policy | State/goal, detached features, noise/action tokens, time → `[B,H,A]`; teacher predicts velocity, student predicts actions. |
-| Agent | `update(batch, stage=...) → metrics`, mutating NNX state. Separate optimizers; rejected nonfinite updates leave state/RNG/step unchanged. |
-| RNG engines | `make_random_engines(seed) → (training, evaluation)`. Models receive `training.jax`; data/validation receive named NumPy streams. Only the utility creates seeds/engines. |
-| Inference | `sample_action_chunk(state, goal, key)` accepts `[O]` or `[B,O]`, returns `[H,A]` or `[B,H,A]`. Fresh key per call. |
-| Trainer | Schedules stages from `agent.step`, samples batches, invokes callbacks; rolls back sampling RNG if an update is rejected. |
-| Evaluation | Owns per-task RNG and per-episode action cache, obeys termination/truncation, validates finite bounded actions. |
-| Run services | Exclusive session directories, immutable original provenance, versioned atomic checkpoints, no metrics append/reuse. |
-
-`representation` updates critic only; `action` updates teacher/student only; `joint`
-updates all from pre-update parameters. Optimizer states persist between stages.
-NNX references remain live after updates, so bound inference does not copy parameters.
-Resume validates semantic dataset hashes, config, code identity, and state structure.
-Add components within their role, document shapes/state/RNG, then verify gradient
-ownership, numerical behavior, and the consuming workflow.
+- Data: observations `[B,O]`, action_chunks `[B,5,A]`, value_goals `[B,O]`.
+  CVAE and CRL use the same value goal. Sampling is episode-safe and float32.
+- Critic: phi features `[B,6,W]`, psi features `[B,W]`; normalized projections
+  `[B,D]`. Independent phi/psi weights; only two scalar calibration parameters.
+- Posterior/prior: `(mean, log_std)` each `[B,5,Z]`; reparameterized sampling.
+- Decoder: `(Z, psi(s), psi(g), mask[B,1,1]) -> bounded actions[B,5,A]`.
+  Gate is applied after condition projection, including biases. No raw condition
+  tokens bypass dropout. Posterior features may receive AE gradients by config.
+- Agent update mutates NNX state; prior-only guidance must not update decoder or
+  critic weights. No hard clip or stop-gradient may break the guide input path.
+- Inference composes prior, sample, decoder; no posterior or dataset action needed.
+- RNG engines, dataset fingerprints, checkpoint atomicity and independent evaluation
+  follow the README. New runs add a unique suffix; resume uses the saved actual path.
+  Checkpoint v4 rejects older architecture/state layouts.

@@ -1,68 +1,54 @@
-# Baseline decisions
+# CVAE POC decisions
 
-## Method
+## Models
 
-[CRL+AC](https://github.com/M-Korniak/action-chunked-contrastive-rl-offline)
-provides the binary-NCE/FQL reference. The new architecture is an experiment, not
-a reproduction claim. Per critic, logits are `phi(s_i,A_i)·psi(g_j)/sqrt(D)`;
-diagonal pairs are positive and all others negative, using mean sigmoid BCE.
-A shared goal encoder supplies actor features before nonlinear contrastive heads.
+Phi processes state + 5 ordered action tokens with shared FFNs and periodic token
+MLPs, then mean-pools ALL 6 tokens before its projection. Psi is a separate MLP
+shared across goals (also applied to state for compatible observation/goal spaces).
+Only projected contrastive features are L2-normalized. Posterior concatenates all
+pre-projection phi tokens with the psi goal feature, applies a Mixer, and produces
+5 diagonal Gaussian latents. Prior uses raw state/goal and detached psi features
+and produces the same latent shape. Decoder receives sampled latents, learned
+positions, and an additive condition `gamma * P(Ps(psi(s))+Pg(psi(g)))`.
 
-[MLP-Mixer](https://arxiv.org/abs/2105.01601)-style residual channel FFNs share weights
-across tokens. Every `exchange_every` layers, and at the end, token MLPs exchange
-information across positions. Layer parameters are independent; FFN hidden size
-is `4*width`, token-MLP hidden size is `2*(H+1)`. State and actions stay tokenized.
-Critic interaction trunks are separate; their goal encoder is shared.
+Decoder condition dropout uses one 0/1 mask per sample, shared over positions,
+after all projections/biases. No inverted-dropout scaling or condition bypass is
+present. Guidance/inference use mask 1. This encourages, but does not guarantee,
+latent usage; compare shuffled/zero latents and condition-on/off reconstruction.
 
-The [FQL](https://arxiv.org/abs/2502.02538) teacher regresses `a-noise` along a linear
-noise/action interpolation. Euler integration supplies a detached teacher target.
-The student minimizes `-mean(Q)/stopgrad(mean(abs(Q))+1e-6)` plus
-`distillation_weight * MSE(raw_student, teacher)`, with `Q=min(Q1,Q2)`. Actor conditions
-use raw state/goal and detached critic features. Critic parameters are fixed during
-actor differentiation, but gradients pass through critic inputs to actions.
-Distillation uses raw student outputs so out-of-bounds values retain a recovery
-gradient; only the Q input is clipped. Teacher targets are clipped after integration
-and detached, while velocities remain unbounded. Rollout sampling clips final
-actions. This follows [official FQL](https://github.com/seohongpark/fql/blob/master/agents/fql.py)
-and corrects the local CRL+AC branch's early clip before distillation.
-There is no TD target critic or reward bootstrap in this objective.
+## Objectives and gradient ownership
 
-## Configuration rationale
+Following [SigLIP](https://github.com/google-research/big_vision/blob/main/big_vision/trainers/proj/image_text/siglip.py),
+`logits = exp(log_scale) * phi @ psi.T + bias`; diagonal positives, all off-diagonal
+negatives. Loss sums pairs per anchor then averages anchors. Initial scale is 10,
+bias is `-log(B-1)` once at initialization. Negative count remains batch dependent.
+The mean-pooling/token architecture and ratio-based bias initialization are POC
+choices, not a SigLIP reproduction or a calibrated reachability guarantee.
 
-| Setting | Starting choice and source/limitation |
-| --- | --- |
-| Learning rate / flow steps | `3e-4` / `10`, reference `agents/accrl.py:get_config`. |
-| Distillation weight | `0.1`, reference code default; replaces the unsupported universal `alpha=10`. Reference README grids also use `1,3,10`: these are experiment-specific alternatives, not evidence that any value is optimal here. |
-| Discount | `0.95`, reference default; controls geometric future-goal offsets, not a TD backup. |
-| Cube/Puzzle chunk / execution | `3` / `1`. Chunk 3 follows the reference manipulation grid; one-step execution isolates extraction and differs from its full-chunk grid protocol. |
-| CPU capacity / batch | Width/latent 128, depth 4, batch 256 are CPU compromises; reference networks are substantially larger with batch 1024. No performance equivalence is claimed. |
-| Optimizer | Separate Adam states, global norm clipping at 10 (a configurable stability choice). |
+The [CVAE](https://papers.nips.cc/paper_files/paper/2015/hash/8d55a249e6baa5c06772297520da2051-Abstract.html)
+reconstructs ground-truth chunks from posterior samples. Reconstruction MSE averages
+batch/time/action; KL(q||p) sums time/latent and averages batch. Posterior/decoder
+minimize reconstruction + beta KL with prior targets fixed. Prior minimizes the
+same KL with posterior fixed plus `-guide_weight * mean(cosine_score(s,D(Zp),g))`.
+These are the separate parameter derivatives of one KL, not double its weight.
+Guide gradients update ONLY prior weights; fixed decoder/critic still transmit
+input gradients. Conditions for prior are always detached. `cvae_updates_crl`
+controls only AE-to-backbone gradients. All groups use pre-update parameters.
 
-Log weighted losses, Q/distillation gradient norms and their ratio, saturation,
-representation norms/variation, and held-out discrimination. Gradient diagnostics
-add backward-pass cost; coefficients must be tuned using learning/evaluation data,
-not loss values alone. `cube_single_noisy.yaml` and `cpu_puzzle.yaml` are starting experiments; `smoke.yaml` only
-tests plumbing. Full learning performance and the sole cause of earlier failed
-cube training remain unverified.
+Default beta=0.01, guide_weight=0.1, latent=16 PER action, width/projection=128,
+encoder/decoder depth=4, posterior depth=2, exchange interval=2. Gaussian log std
+is smoothly bounded to [-4,1], initialized near 0. Decoder uses differentiable
+tanh: no hard clip; severe tanh saturation can still reduce gradients. Prior LR is
+1e-4; other groups use 3e-4, Adam, global gradient norm cap 10. These are untuned
+CPU-sized starting settings. No full learning-performance claim is made.
 
-## Data and experiments
+## Experiment contract
 
-The [official OGBench loader](https://github.com/seohongpark/ogbench/blob/master/ogbench/utils.py)
-provides separate train/validation splits. Regular transitions allow complete
-within-episode chunks and their final next state. Critic future offsets are clipped
-geometric; actor offsets are uniform positive futures. Including the final next
-state differs from the compact reference sampler; match samplers for reproduction.
-No observation normalization, frame stacking, augmentation, or random-goal mixture
-is silently added. Only standard vector-state/continuous-action datasets are supported.
-
-`make_random_engines(seed)` creates training/evaluation engines at entry and seeds
-legacy Python/NumPy APIs once. Explicit initialization/update/data/validation streams
-are independent; evaluation derives fixed per-task keys and per-episode environment
-seeds, so task order or evaluation cadence cannot advance training randomness.
-NumPy Generator states and typed JAX keys/counters are saved and restored.
-Task success is any success during an episode, averaged equally across selected tasks. A fresh session
-stores each evaluation/resume, with code/dependency snapshots and dataset hashes.
-Checkpoint format v3 requires the centralized RNG layout; v2 is rejected. Exact
-resume is checked at accepted-update boundaries; diagnostics interrupted mid-callback can be absent from that session.
-Multiple seeds, matched sampling/capacity/budgets, and learning curves are required
-before concluding that tokens, embeddings, or a particular coefficient help.
+Use the same geometric future goal (discount 0.95) for CRL and CVAE; complete chunks
+never cross episodes. Official OGBench train/validation splits remain separate.
+Training/evaluation RNG engines and atomic finite-update rejection are retained.
+`representation` trains critic only, `action` trains posterior/decoder/prior with
+critic frozen, `joint` enables all. Optimizer states persist across stages.
+Report prior-vs-posterior generation, KL, latent sensitivity, standard deviations,
+condition gate, score calibration, guidance/KL gradient balance, task success,
+compute and multiple-seed variability before drawing conclusions.

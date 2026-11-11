@@ -1,15 +1,23 @@
 seed: 0
 output_dir: runs/smoke
 agent:
-  chunk_length: 2
+  chunk_length: 5
   width: 16
   depth: 2
   exchange_every: 2
   latent_dim: 8
+  vae_latent_dim: 3
+  fusion_depth: 2
+  prior_learning_rate: 0.0001
+  kl_weight: 0.01
+  guide_weight: 0.1
+  guidance_enabled: true
+  cvae_updates_crl: false
+  condition_drop_prob: 0.2
+  log_std_min: -4.0
+  log_std_max: 1.0
   learning_rate: 0.0003
-  flow_steps: 2
   max_grad_norm: 10.0
-  distillation_weight: 0.1
 data:
   synthetic: true
   batch_size: 4

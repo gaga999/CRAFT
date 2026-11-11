@@ -10,7 +10,7 @@ import jax
 import numpy as np
 from flax import nnx, serialization
 
-FORMAT_VERSION = 3
+FORMAT_VERSION = 4
 
 
 def _is_key(value):
@@ -56,7 +56,7 @@ def read_checkpoint(path):
     payload = serialization.msgpack_restore(raw)
     if not isinstance(payload, dict) or payload.get("format_version") != FORMAT_VERSION:
         raise ValueError(
-            "Unsupported checkpoint format; expected v3 with centralized RNG streams. Start a new run for older checkpoints."
+            "Unsupported checkpoint format; expected v4 CVAE POC. Start a new run for older checkpoints."
         )
     if not isinstance(payload.get("agent"), dict) or not isinstance(
         payload.get("run_state"), str

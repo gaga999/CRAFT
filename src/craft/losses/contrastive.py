@@ -1,22 +1,17 @@
-"""Binary NCE as in the reference action-chunked CRL implementation."""
+"""SigLIP-style BxB logits; sum pairs per anchor, then average anchors."""
 
+import jax
 import jax.numpy as jnp
-import optax
 
 
-def contrastive_loss(phi, psi):
-    logits = jnp.einsum("ebd,ecd->ebc", phi, psi) / jnp.sqrt(phi.shape[-1])
-    labels = jnp.eye(phi.shape[1])[None]
-    loss = optax.sigmoid_binary_cross_entropy(logits, labels).mean()
+def contrastive_loss(phi, psi, log_scale, bias):
+    logits = jnp.exp(log_scale) * (phi @ psi.T) + bias
+    labels = 2 * jnp.eye(phi.shape[0]) - 1
+    loss = -jax.nn.log_sigmoid(labels * logits).sum(-1).mean()
     return loss, {
         "critic/loss": loss,
-        "critic/phi_norm": jnp.linalg.norm(phi, axis=-1).mean(),
-        "critic/psi_norm": jnp.linalg.norm(psi, axis=-1).mean(),
-        "critic/psi_std": jnp.std(psi, axis=1).mean(),
-        "critic/accuracy": (logits.argmax(-1) == jnp.arange(phi.shape[1])).mean(),
-        "critic/positive": jnp.diagonal(logits, axis1=1, axis2=2).mean(),
+        "critic/scale": jnp.exp(log_scale),
+        "critic/bias": bias,
+        "critic/accuracy": (logits.argmax(-1) == jnp.arange(phi.shape[0])).mean(),
+        "critic/positive": jnp.diag(logits).mean(),
     }
-
-
-def q_values(phi, psi):
-    return (phi * psi).sum(-1) / jnp.sqrt(phi.shape[-1])

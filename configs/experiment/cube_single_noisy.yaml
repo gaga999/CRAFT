@@ -1,17 +1,23 @@
-# CPU-sized starting point, not a tuned result or paper-equivalent capacity.
-# Standard OGBench noisy dataset, not the reference's custom sigma=1 noise ablation.
 seed: 0
 output_dir: runs/cube_single_noisy
 agent:
-  chunk_length: 3
+  chunk_length: 5
   width: 128
   depth: 4
   exchange_every: 2
   latent_dim: 128
+  vae_latent_dim: 16
+  fusion_depth: 2
+  prior_learning_rate: 0.0001
+  kl_weight: 0.01
+  guide_weight: 0.1
+  guidance_enabled: true
+  cvae_updates_crl: false
+  condition_drop_prob: 0.2
+  log_std_min: -4.0
+  log_std_max: 1.0
   learning_rate: 0.0003
-  flow_steps: 10
   max_grad_norm: 10.0
-  distillation_weight: 0.1
 data:
   name: cube-single-noisy-v0
   directory: data/ogbench

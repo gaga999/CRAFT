@@ -86,7 +86,9 @@ def run_experiment(
     identity = None
     try:
         if saved is None:
+            config = dict(config)
             session = allocate_session(config, mode="train")
+            config["output_dir"] = str(session)
         if evaluate:
             env = make_env(config["data"]["name"])
             observation_dim, action_dim = saved["dimensions"]
@@ -128,7 +130,11 @@ def run_experiment(
             if any(task > available for task in config["evaluation"]["task_ids"]):
                 raise ValueError("evaluation.task_ids exceeds environment task count")
         agent = CRAFTAgent.create(
-            observation_dim, action_dim, config["agent"], rngs=training_engine.jax
+            observation_dim,
+            action_dim,
+            config["agent"],
+            rngs=training_engine.jax,
+            batch_size=config["data"]["batch_size"],
         )
         if saved is not None:
             restored = restore_checkpoint(checkpoint, agent=agent, payload=payload)
@@ -181,7 +187,10 @@ def run_experiment(
             eval_due = env is not None and step % config["train"]["eval_interval"] == 0
             if log_due and val is not None:
                 metrics.update(
-                    agent.validation_metrics(val.sample(config["data"]["batch_size"]))
+                    agent.validation_metrics(
+                        val.sample(config["data"]["batch_size"]),
+                        evaluation_engine.task_key(0),
+                    )
                 )
             if eval_due:
                 metrics.update(evaluation_metrics())

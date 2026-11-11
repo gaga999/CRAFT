@@ -79,12 +79,16 @@ def allocate_session(
     root = Path(config["output_dir"]).expanduser().resolve()
     token = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
     if mode == "train":
-        path = root
+        path = root.with_name(f"{root.name}-{token}")
+        config = {**config, "output_dir": str(path)}
     elif mode == "resume":
         path = root / "sessions" / f"resume-{token}"
     elif mode == "evaluate":
         path = (
-            Path(destination).expanduser().resolve()
+            Path(destination)
+            .expanduser()
+            .resolve()
+            .with_name(f"{Path(destination).name}-{token}")
             if destination
             else root.parent / "evaluations" / f"{root.name}-{token}"
         )
