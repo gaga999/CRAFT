@@ -1,6 +1,7 @@
 """Experiment assembly; session-local services keep source runs immutable."""
 
 import json
+from math import gcd
 from pathlib import Path
 
 from craft.agents.craft import CRAFTAgent
@@ -225,6 +226,15 @@ def run_experiment(
                 workers=config["data"]["workers"],
                 prefetch_batches=config["data"]["prefetch_batches"],
                 device_prefetch=config["data"]["device_prefetch"],
+                # Every log/eval/save step is a chunk end, so callbacks are unchanged.
+                steps_per_call=min(
+                    100,
+                    gcd(
+                        config["train"]["log_interval"],
+                        config["train"]["eval_interval"],
+                        config["train"]["save_interval"],
+                    ),
+                ),
             )
         except KeyboardInterrupt:
             save()

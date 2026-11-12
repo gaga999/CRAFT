@@ -10,7 +10,13 @@ from unittest.mock import patch
 import numpy as np
 from flax import nnx
 from omegaconf.errors import OmegaConfBaseException
-from test_baseline import FakeEnv, equal, seeded_agent, seeded_source
+from test_baseline import (
+    FakeEnv,
+    assert_equivalent_training,
+    equal,
+    seeded_agent,
+    seeded_source,
+)
 
 from craft.config import load_config
 from craft.experiments import run_experiment
@@ -151,6 +157,54 @@ class RuntimeTests(unittest.TestCase):
             ):
                 run_experiment(c, checkpoint=run / "checkpoint.msgpack")
             self.assertEqual(before, snapshot(run))
+
+    def test_chunked_training_matches_single_steps(self):
+        from craft.trainers.offline import train_offline
+
+        config = load_config("configs/experiment/smoke.yaml")["agent"]
+        stages = [
+            {"name": "representation", "steps": 3},
+            {"name": "joint", "steps": 7},
+        ]
+        results = {}
+        for steps_per_call in (1, 4):
+            ds, _ = seeded_source()
+            agent = seeded_agent(0, 6, 2, config)
+            observed = []
+            # Resume mid-schedule to cover unaligned chunk starts.
+            for max_steps in (2, None):
+                train_offline(
+                    agent,
+                    ds,
+                    stages,
+                    batch_size=4,
+                    max_steps=max_steps,
+                    steps_per_call=steps_per_call,
+                    on_step=lambda step, stage, m, seen=observed: seen.append(
+                        (step, stage)
+                    ),
+                )
+            results[steps_per_call] = (agent, ds.rng.bit_generator.state, observed)
+        (single, single_rng, single_steps) = results[1]
+        (chunked, chunked_rng, chunked_steps) = results[4]
+        self.assertEqual(int(chunked.step[...]), 10)
+        self.assertEqual(single_rng, chunked_rng)
+        assert_equivalent_training(
+            self, single, chunked, 10, config, seeded_source(1)[0].sample(8)
+        )
+        self.assertEqual(
+            chunked_steps,
+            [
+                (2, "representation"),
+                (3, "representation"),
+                (4, "joint"),
+                (8, "joint"),
+                (10, "joint"),
+            ],
+        )
+        self.assertTrue(set(chunked_steps) <= set(single_steps))
+        with self.assertRaises(ValueError):
+            train_offline(chunked, ds, stages, batch_size=4, steps_per_call=0)
 
     def test_interrupt_checkpoint_and_sampler_rollback(self):
         from craft.trainers.offline import train_offline

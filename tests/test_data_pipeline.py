@@ -174,6 +174,33 @@ class PrefetchTests(unittest.TestCase):
                     with self.assertRaises(StopIteration):
                         next(batches)
 
+    def test_chunks_stack_sequential_batches_and_accept_as_one_unit(self):
+        for workers in (0, 2):
+            with self.subTest(workers=workers):
+                ds, reference = source(3), source(3)
+                before = deepcopy(ds.rng.bit_generator.state)
+                with PrefetchBatches(ds, 8, 5, workers=workers) as batches:
+                    chunk = batches.next_chunk(3)
+                    self.assertEqual(ds.rng.bit_generator.state, before)
+                    with self.assertRaises(RuntimeError):
+                        batches.next_chunk(1)
+                    for i in range(3):
+                        assert_batches(
+                            self,
+                            {k: v[i] for k, v in chunk.items()},
+                            reference.sample(8, include_actor_goals=False),
+                        )
+                    batches.accept()
+                    self.assertEqual(
+                        ds.rng.bit_generator.state, reference.rng.bit_generator.state
+                    )
+                    with self.assertRaises(StopIteration):
+                        batches.next_chunk(3)
+                    with self.assertRaises(ValueError):
+                        batches.next_chunk(0)
+                    batches.next_chunk(2)
+                    batches.accept()
+
     def test_unaccepted_batch_and_lookahead_regenerate_after_json_restore(self):
         ds, reference = source(5), source(5)
         with PrefetchBatches(ds, 8, 50, workers=3) as batches:

@@ -25,6 +25,38 @@ def equal(a, b):
     return xt == yt and all(np.array_equal(i, j) for i, j in zip(x, y))
 
 
+def assert_equivalent_training(test, expected, actual, steps, config, batch):
+    """Same updates through different XLA programs (e.g. scanned vs single).
+
+    Rounding differs between programs. Token-mixer output biases have
+    analytically zero gradients (a per-token constant cancelled by the next
+    LayerNorm), and Adam normalizes their rounding noise into up to one
+    learning-rate step per update, so parameters are bounded by lr * steps
+    while outputs must agree tightly.
+    """
+    test.assertEqual(int(expected.step[...]), int(actual.step[...]))
+    test.assertEqual(
+        int(expected.rngs.updates.count[...]), int(actual.rngs.updates.count[...])
+    )
+    key = jax.random.key(0)
+    want = expected.validation_metrics(batch, key)
+    got = actual.validation_metrics(batch, key)
+    for name in want:
+        np.testing.assert_allclose(got[name], want[name], rtol=1e-4, atol=1e-5)
+    gaps = sorted(
+        (
+            float(np.max(np.abs(np.asarray(x) - np.asarray(y)), initial=0)),
+            jax.tree_util.keystr(path),
+        )
+        for (path, x), (_, y) in zip(
+            jax.tree.flatten_with_path(pure_state(expected))[0],
+            jax.tree.flatten_with_path(pure_state(actual))[0],
+        )
+    )
+    bound = steps * max(config["learning_rate"], config["prior_learning_rate"])
+    test.assertLess(gaps[-1][0], bound, msg=gaps[-5:])
+
+
 def seeded_agent(seed, observation_dim, action_dim, config):
     engine, _ = make_random_engines(seed)
     return CRAFTAgent.create(observation_dim, action_dim, config, rngs=engine.jax)
@@ -208,6 +240,26 @@ class POCTests(unittest.TestCase):
         critic = pure_state(self.a)["critic"]
         self.a.update(self.b, stage="action")
         self.assertTrue(equal(critic, pure_state(self.a)["critic"]))
+
+    def test_update_chunk_matches_sequential_updates_and_rejects_atomically(self):
+        source = seeded_source()[0]
+        batches = [source.sample(4, include_actor_goals=False) for _ in range(3)]
+        stacked = jax.tree.map(lambda *x: jnp.stack(x), *batches)
+        sequential = nnx.clone(self.initial)
+        for batch in batches:
+            last = sequential.update(batch, stage="joint")
+        metrics = self.a.update_chunk(stacked, stage="joint")
+        self.assertTrue(bool(metrics["numerics/finite"]))
+        self.assertEqual(int(self.a.step[...]), 3)
+        assert_equivalent_training(self, sequential, self.a, 3, self.c, batches[0])
+        self.assertAlmostEqual(
+            float(metrics["critic/loss"]), float(last["critic/loss"]), places=5
+        )
+        before = pure_state(self.a)
+        bad = jax.tree.map(np.array, stacked)
+        bad["observations"][1] = np.nan
+        self.assertFalse(bool(self.a.update_chunk(bad)["numerics/finite"]))
+        self.assertTrue(equal(before, pure_state(self.a)))
 
     def test_checkpoint_and_gaussian_reparameterization(self):
         self.a.update(self.b)

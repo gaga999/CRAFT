@@ -8,6 +8,7 @@ from queue import Empty, Full, Queue
 from threading import Event, Thread
 
 import jax
+import jax.numpy as jnp
 
 
 @dataclass
@@ -58,6 +59,7 @@ class PrefetchBatches:
         self._stop = Event()
         self._thread = None
         self._current = None
+        self._current_count = 0
         self._consumed = 0
         self._entered = False
 
@@ -118,13 +120,7 @@ class PrefetchBatches:
     def __iter__(self):
         return self
 
-    def __next__(self):
-        if not self._entered or self._stop.is_set():
-            raise RuntimeError("Prefetch iterator must be used inside its context")
-        if self._current is not None:
-            raise RuntimeError("Accept the current batch before requesting another")
-        if self._consumed == self.count:
-            raise StopIteration
+    def _next_item(self):
         if self.workers:
             while True:
                 try:
@@ -142,15 +138,42 @@ class PrefetchBatches:
             )
         if isinstance(item, WorkerFailure):
             raise item.error
-        self._current = item
-        return item.batch
+        return item
+
+    def _check_next(self, count):
+        if not self._entered or self._stop.is_set():
+            raise RuntimeError("Prefetch iterator must be used inside its context")
+        if self._current is not None:
+            raise RuntimeError("Accept the current batch before requesting another")
+        if self._consumed + count > self.count:
+            raise StopIteration
+
+    def __next__(self):
+        self._check_next(1)
+        self._current, self._current_count = self._next_item(), 1
+        return self._current.batch
+
+    def next_chunk(self, count):
+        """Return `count` consecutive batches stacked on a new leading axis.
+
+        They are pending as one unit: accept() commits all of them, and an
+        unaccepted chunk regenerates identically after restore.
+        """
+        if type(count) is not int or count < 1:
+            raise ValueError("count must be an integer >= 1")
+        self._check_next(count)
+        items = [self._next_item() for _ in range(count)]
+        stacked = jax.tree.map(lambda *x: jnp.stack(x), *(i.batch for i in items))
+        self._current = PreparedBatch(stacked, items[-1].rng_state)
+        self._current_count = count
+        return stacked
 
     def accept(self):
         if self._current is None:
             raise RuntimeError("No batch is awaiting acceptance")
         self.dataset.rng.bit_generator.state = self._current.rng_state
         self._current = None
-        self._consumed += 1
+        self._consumed += self._current_count
 
     @property
     def pending(self):

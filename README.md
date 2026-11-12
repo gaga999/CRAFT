@@ -33,9 +33,15 @@ transferred asynchronously via JAX `device_put`. Threads avoid dataset replicati
 and process serialization. Set `data.workers=0` for synchronous batch preparation
 (used by the smoke config). These are bounded buffers, not a full-dataset GPU preload.
 
-`time/data_wait_seconds` measures consumer wait for the next prefetched batch;
-`time/update_seconds` measures the update including its finite-result barrier.
-Any unfinished asynchronous transfer is included in update time.
+Each `nnx.jit` call costs ~10–35 ms of host time (NNX graph traversal of ~450
+variables plus XLA dispatch), more than this model's device time per update.
+Training therefore runs `agent.update_chunk`: one `lax.scan` over up to
+gcd(log, eval, save intervals) ≤ 100 consecutive updates per dispatch. Updates
+and callback steps are unchanged; a nonfinite update rejects its whole chunk.
+`time/data_wait_seconds` (consumer wait for prefetched batches) and
+`time/update_seconds` (update including its finite-result barrier) are per-step
+averages over the chunk. Any unfinished asynchronous transfer is included in
+update time.
 Compilation, evaluation, logging, and checkpoint writes can also affect GPU
 utilization. Performance depends on the host and accelerator; prefetch is not a
 claim that data loading is the current bottleneck.

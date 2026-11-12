@@ -171,11 +171,38 @@ class CRAFTAgent(nnx.Module):
                     agent.optimizers[i].update(model, gradients[i])
             agent.step[...] += 1
 
-        def reject(agent):
-            agent.rngs.updates.count[...] = previous
-
-        nnx.cond(finite, commit, reject, self)
+        # Select instead of nnx.cond: a device conditional makes XLA copy the
+        # predicate to the host mid-step, serializing every update. Rejection
+        # restores parameters, optimizer state, step and the RNG count.
+        rejected = jax.tree.map(lambda x: x, nnx.state(self))
+        rejected_count = previous
+        commit(self)
+        committed = nnx.state(self)
+        nnx.update(
+            self,
+            jax.tree.map(
+                lambda new, old: jnp.where(finite, new, old), committed, rejected
+            ),
+        )
+        self.rngs.updates.count[...] = jnp.where(
+            finite, self.rngs.updates.count[...], rejected_count
+        )
         return {**metrics, "numerics/finite": finite}
+
+    def update_chunk(self, batches, *, stage="joint"):
+        """Run `update` over batches stacked on a leading axis in one dispatch.
+
+        Per-call host cost (NNX graph traversal plus XLA dispatch) exceeds this
+        model's device time, so scanning many updates per call keeps the GPU
+        busy. Updates are identical to calling `update` once per batch. Returns
+        last-step metrics; `numerics/finite` is true only if every step was
+        finite, otherwise no state from the chunk is committed.
+        """
+        graphdef, state = nnx.split(self)
+        state, metrics = _scan_updates(graphdef, state, batches, stage)
+        if bool(metrics["numerics/finite"]):
+            nnx.update(self, state)
+        return metrics
 
     @nnx.jit
     def sample_action_chunk(self, observations, goals, rng):
@@ -207,3 +234,16 @@ class CRAFTAgent(nnx.Module):
             }
         )
         return {f"validation/{k}": v for k, v in metrics.items()}
+
+
+@partial(jax.jit, static_argnames=("graphdef", "stage"))
+def _scan_updates(graphdef, state, batches, stage):
+    def body(state, batch):
+        agent = nnx.merge(graphdef, state)
+        metrics = agent.update(batch, stage=stage)
+        return nnx.state(agent), metrics
+
+    state, metrics = jax.lax.scan(body, state, batches)
+    finite = jnp.all(metrics.pop("numerics/finite"))
+    last = jax.tree.map(lambda x: x[-1], metrics)
+    return state, {**last, "numerics/finite": finite}
