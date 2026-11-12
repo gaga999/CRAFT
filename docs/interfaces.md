@@ -13,4 +13,4 @@
 - Inference composes prior, sample, decoder; no posterior or dataset action needed.
 - RNG engines, dataset fingerprints, checkpoint atomicity and independent evaluation
   follow the README. New runs add a unique suffix; resume uses the saved actual path.
-  Checkpoint v4 rejects older architecture/state layouts.
+  Checkpoint v5 rejects older architecture/state layouts.

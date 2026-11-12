@@ -177,5 +177,5 @@ class EngineTests(unittest.TestCase):
                     {"format_version": 2, "agent": {}, "run_state": "{}"}
                 )
             )
-            with self.assertRaisesRegex(ValueError, "expected v4"):
+            with self.assertRaisesRegex(ValueError, "expected v5"):
                 read_checkpoint(path)

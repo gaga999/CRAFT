@@ -99,13 +99,17 @@ class Decoder(nnx.Module):
         self.position = nnx.Param(
             nnx.initializers.normal(0.02)(rngs.params(), (1, h, w))
         )
-        self.gate = nnx.Param(jnp.array(0.1, jnp.float32))
+        self.log_gate = nnx.Param(jnp.log(jnp.array(0.1, jnp.float32)))
         self.mixer = TokenMixer(
             h, w, config["depth"], config["exchange_every"], rngs=rngs
         )
         self.output = nnx.Linear(
             w, action_dim, kernel_init=nnx.initializers.normal(0.01), rngs=rngs
         )
+
+    @property
+    def gate(self):
+        return jnp.exp(self.log_gate[...])
 
     def __call__(self, z, state_features, goal_features, mask):
         c = self.state_condition(state_features) + self.goal_condition(goal_features)

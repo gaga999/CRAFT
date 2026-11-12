@@ -3,13 +3,17 @@
 ## Models
 
 Phi processes state + 5 ordered action tokens with shared FFNs and periodic token
-MLPs, then mean-pools ALL 6 tokens before its projection. Psi is a separate MLP
-shared across goals (also applied to state for compatible observation/goal spaces).
+MLPs, then mean-pools ALL 6 tokens before its projection. Token exchange uses two
+kernel-size-1 convolutions with tokens as channels, preserving `[B,T,W]` without
+explicit transposes; channel FFNs remain dense. GPU layout/performance is unverified.
+Psi is a separate MLP shared across goals (also applied to state for compatible
+observation/goal spaces).
 Only projected contrastive features are L2-normalized. Posterior concatenates all
 pre-projection phi tokens with the psi goal feature, applies a Mixer, and produces
 5 diagonal Gaussian latents. Prior uses raw state/goal and detached psi features
 and produces the same latent shape. Decoder receives sampled latents, learned
-positions, and an additive condition `gamma * P(Ps(psi(s))+Pg(psi(g)))`.
+positions, and an additive condition `exp(log_gate) * P(Ps(psi(s))+Pg(psi(g)))`.
+The gate is initialized to 0.1; only its logarithm is learned.
 
 Decoder condition dropout uses one 0/1 mask per sample, shared over positions,
 after all projections/biases. No inverted-dropout scaling or condition bypass is
@@ -29,7 +33,10 @@ The [CVAE](https://papers.nips.cc/paper_files/paper/2015/hash/8d55a249e6baa5c067
 reconstructs ground-truth chunks from posterior samples. Reconstruction MSE averages
 batch/time/action; KL(q||p) sums time/latent and averages batch. Posterior/decoder
 minimize reconstruction + beta KL with prior targets fixed. Prior minimizes the
-same KL with posterior fixed plus `-guide_weight * mean(cosine_score(s,D(Zp),g))`.
+same KL with posterior fixed plus `-guide_weight * mean(logit(s,D(Zp),g))`.
+Guide and CRL share `logit = exp(log_scale) * dot(phi,psi) + bias`, without an
+extra sigmoid. Scale multiplies the prior guidance gradient; the fixed critic bias
+shifts the loss but has no prior gradient. Guide weight remains untuned.
 These are the separate parameter derivatives of one KL, not double its weight.
 Guide gradients update ONLY prior weights; fixed decoder/critic still transmit
 input gradients. Conditions for prior are always detached. `cvae_updates_crl`

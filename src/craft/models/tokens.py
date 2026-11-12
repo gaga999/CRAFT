@@ -1,9 +1,50 @@
 """NNX token-wise shared FFNs with periodic residual MLP exchange."""
 
+import jax
 import jax.numpy as jnp
 from flax import nnx
 
 from craft.models.mlp import MLP
+from craft.models.similarity import siglip_logits
+
+
+class TokenPointwiseLinear(nnx.Module):
+    """Mix token channels in [batch, tokens, width] without swapping axes."""
+
+    def __init__(self, in_tokens, out_tokens, *, rngs):
+        self.kernel = nnx.Param(
+            nnx.initializers.lecun_normal()(
+                rngs.params(), (1, in_tokens, out_tokens), jnp.float32
+            )
+        )
+        self.bias = nnx.Param(
+            nnx.initializers.zeros(rngs.params(), (out_tokens,), jnp.float32)
+        )
+
+    def __call__(self, x):
+        return (
+            jax.lax.conv_general_dilated(
+                x,
+                self.kernel[...],
+                window_strides=(1,),
+                padding="VALID",
+                dimension_numbers=("NCW", "WIO", "NCW"),
+            )
+            + self.bias[...][None, :, None]
+        )
+
+
+class TokenPointwiseMLP(nnx.Module):
+    def __init__(self, tokens, *, rngs):
+        self.layers = nnx.List(
+            [
+                TokenPointwiseLinear(tokens, 2 * tokens, rngs=rngs),
+                TokenPointwiseLinear(2 * tokens, tokens, rngs=rngs),
+            ]
+        )
+
+    def __call__(self, x):
+        return self.layers[1](nnx.gelu(self.layers[0](x)))
 
 
 class MixerBlock(nnx.Module):
@@ -13,7 +54,7 @@ class MixerBlock(nnx.Module):
         self.exchange = exchange
         if exchange:
             self.token_norm = nnx.LayerNorm(width, rngs=rngs)
-            self.token_mlp = MLP(tokens, (2 * tokens,), tokens, rngs=rngs)
+            self.token_mlp = TokenPointwiseMLP(tokens, rngs=rngs)
 
     def local(self, x):
         return x + self.ffn(self.ffn_norm(x))
@@ -21,8 +62,7 @@ class MixerBlock(nnx.Module):
     def __call__(self, x):
         x = self.local(x)
         if self.exchange:
-            y = jnp.swapaxes(self.token_norm(x), -1, -2)
-            x = x + jnp.swapaxes(self.token_mlp(y), -1, -2)
+            x = x + self.token_mlp(self.token_norm(x))
         return x
 
 
@@ -164,4 +204,4 @@ class TokenCritic(nnx.Module):
 
     def score(self, states, actions, goals):
         phi, psi = self(states, actions, goals)
-        return (phi * psi).sum(-1)
+        return siglip_logits(phi, psi, self.log_scale[...], self.bias[...])

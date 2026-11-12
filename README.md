@@ -38,13 +38,14 @@ Zq or Zp + position + gated state/goal condition -> decoder Mixer -> tanh action
 
 Chunk length is 5. Posterior fuses 6 phi tokens and one psi goal token, then reads
 5 action positions. Decoder has 5 latent tokens; conditions have separate state/goal
-projections, a learned scalar gate, and per-sample branch dropout (default 0.2).
-Inference/guidance keep the condition on. Shared FFNs exchange information every
+projections, a learned positive scalar gate, and per-sample branch dropout
+(default 0.2). Inference/guidance keep the condition on. Shared FFNs exchange information every
 2 layers. Prior/decoder share no weights with critic; they use actual detached critic
 features. There is no FQL teacher or student.
 
-Losses: sigmoid CRL with learned positive scale/bias; posterior reconstruction plus
-Gaussian KL; prior KL plus cosine critic guidance (enabled by default). Guidance
+Losses: sigmoid CRL with learned positive scale and signed bias; posterior
+reconstruction plus Gaussian KL; prior KL plus SigLIP-logit critic guidance
+(enabled by default). Guidance
 updates only prior weights, differentiating THROUGH fixed decoder/critic weights.
 No hard action clip is used in training or guidance; tanh bounds decoder outputs.
 CVAE-to-CRL gradients are optional (`agent.cvae_updates_crl`, default false).
@@ -64,8 +65,8 @@ uv run python scripts/evaluate.py --config "$RUN_DIR/config.yaml" \
 ```
 
 Resume creates a new session under the original run; evaluation writes outside it.
-Original metadata/metrics remain immutable. Checkpoint **v4** stores all NNX model,
-optimizer, RNG, sampler and schedule state; older FQL checkpoints are rejected.
+Original metadata/metrics remain immutable. Checkpoint **v5** stores all NNX model,
+optimizer, RNG, sampler and schedule state; older checkpoints are rejected.
 Code changes on resume require explicit `--allow-code-change`. Sessions archive
 resolved config, code/dependencies, environment metadata, dataset hashes and JSONL
 metrics. Ctrl-C saves the latest accepted update; hard termination relies on the

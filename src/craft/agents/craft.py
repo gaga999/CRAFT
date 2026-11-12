@@ -152,7 +152,7 @@ class CRAFTAgent(nnx.Module):
                 "prior/guide_grad_norm": optax.tree.norm(gg),
                 "prior/guide_to_kl_grad_ratio": optax.tree.norm(gg)
                 / (optax.tree.norm(kg) + 1e-8),
-                "decoder/condition_gate": self.decoder.gate[...],
+                "decoder/condition_gate": self.decoder.gate,
                 "decoder/condition_keep": mask.mean(),
                 "vae/posterior_std": jnp.exp(q[1]).mean(),
                 "prior/std": jnp.exp(pp[1]).mean(),
