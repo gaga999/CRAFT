@@ -25,6 +25,9 @@ data:
   synthetic: false
   batch_size: 256
   discount: 0.99
+  workers: 2
+  prefetch_batches: 4
+  device_prefetch: 2
 train:
   stages:
     - name: joint

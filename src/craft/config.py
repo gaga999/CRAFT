@@ -36,6 +36,9 @@ class DataConfig:
     synthetic: bool = False
     batch_size: int = 256
     discount: float = 0.95
+    workers: int = 2
+    prefetch_batches: int = 4
+    device_prefetch: int = 2
 
 
 @dataclass
@@ -170,6 +173,9 @@ def validate_config(config):
     if config["seed"] >= 2**32:
         raise ValueError("seed must be less than 2**32")
     positive_int(config["data"]["batch_size"], "data.batch_size", 2)
+    positive_int(config["data"]["workers"], "data.workers", 0)
+    positive_int(config["data"]["prefetch_batches"], "data.prefetch_batches")
+    positive_int(config["data"]["device_prefetch"], "data.device_prefetch")
     finite_float(config["data"]["discount"], "data.discount")
     if config["data"]["discount"] >= 1:
         raise ValueError("data.discount must be < 1")

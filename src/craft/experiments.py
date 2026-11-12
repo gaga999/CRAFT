@@ -30,9 +30,22 @@ def check_restore(config, saved, *, evaluate):
     fields = (
         ("seed", "agent", "data", "train", "output_dir") if evaluate else tuple(config)
     )
-    if any(config[key] != saved["config"][key] for key in fields):
+
+    def contract(value, key):
+        if key == "data":
+            return {
+                k: v
+                for k, v in value.items()
+                if k not in ("workers", "prefetch_batches", "device_prefetch")
+            }
+        return value
+
+    if any(
+        contract(config[key], key) != contract(saved["config"][key], key)
+        for key in fields
+    ):
         raise ValueError(
-            "Checkpoint/config mismatch; resume needs its original configuration, evaluation may change only evaluation/logging settings"
+            "Checkpoint/config mismatch; resume needs its original configuration except data prefetch settings, evaluation may also change evaluation/logging settings"
         )
     total = sum(s["steps"] for s in saved["config"]["train"]["stages"])
     if type(saved["step"]) is not int or not 0 <= saved["step"] <= total:
@@ -188,7 +201,9 @@ def run_experiment(
             if log_due and val is not None:
                 metrics.update(
                     agent.validation_metrics(
-                        val.sample(config["data"]["batch_size"]),
+                        val.sample(
+                            config["data"]["batch_size"], include_actor_goals=False
+                        ),
                         evaluation_engine.task_key(0),
                     )
                 )
@@ -207,6 +222,9 @@ def run_experiment(
                 batch_size=config["data"]["batch_size"],
                 max_steps=max_steps,
                 on_step=on_step,
+                workers=config["data"]["workers"],
+                prefetch_batches=config["data"]["prefetch_batches"],
+                device_prefetch=config["data"]["device_prefetch"],
             )
         except KeyboardInterrupt:
             save()

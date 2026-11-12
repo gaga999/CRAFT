@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from craft.data.offline import OfflineDataset
+from craft.data.loading import load_ogbench_datasets
 
 
 def make_env(name):
@@ -45,23 +45,16 @@ def make_env_and_datasets(
     dataset_dir="data/ogbench",
     dataset_path=None,
 ):
-    import ogbench
-
     env = make_env(name)
     try:
-        train, val = ogbench.make_env_and_datasets(
+        train, val = load_ogbench_datasets(
             name,
-            dataset_dir=dataset_dir,
-            dataset_path=dataset_path,
-            compact_dataset=False,
-            dataset_only=True,
-            cur_env=env,
-        )
-        train = OfflineDataset(train, chunk_length, discount, rng=rng)
-        val = (
-            None
-            if val is None
-            else OfflineDataset(val, chunk_length, discount, rng=validation_rng)
+            directory=dataset_dir,
+            path=dataset_path,
+            chunk_length=chunk_length,
+            discount=discount,
+            rng=rng,
+            validation_rng=validation_rng,
         )
         for source in (train, val):
             if source is not None and (

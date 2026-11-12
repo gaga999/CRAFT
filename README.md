@@ -25,6 +25,21 @@ For NVIDIA Linux, install `uv sync --locked --extra cuda` and keep `--extra cuda
 on `uv run`; select a device using `CUDA_VISIBLE_DEVICES=0 JAX_PLATFORMS=cuda`.
 See [JAX device requirements](https://docs.jax.dev/en/latest/installation.html).
 
+Datasets stay in shared host RAM in OGBench's compact storage layout. Train and
+validation splits load concurrently; next observations are gathered only for
+sampled goals. By default, `data.workers=2` NumPy worker threads prepare up to
+`data.prefetch_batches=4` CPU batches, with `data.device_prefetch=2` queued batches
+transferred asynchronously via JAX `device_put`. Threads avoid dataset replication
+and process serialization. Set `data.workers=0` for synchronous batch preparation
+(used by the smoke config). These are bounded buffers, not a full-dataset GPU preload.
+
+`time/data_wait_seconds` measures consumer wait for the next prefetched batch;
+`time/update_seconds` measures the update including its finite-result barrier.
+Any unfinished asynchronous transfer is included in update time.
+Compilation, evaluation, logging, and checkpoint writes can also affect GPU
+utilization. Performance depends on the host and accelerator; prefetch is not a
+claim that data loading is the current bottleneck.
+
 ## Architecture
 
 ```text
@@ -71,6 +86,11 @@ Code changes on resume require explicit `--allow-code-change`. Sessions archive
 resolved config, code/dependencies, environment metadata, dataset hashes and JSONL
 metrics. Ctrl-C saves the latest accepted update; hard termination relies on the
 last periodic save.
+
+The three data prefetch settings may change on resume: worker scheduling does not
+change sample order or committed sampler state. Lookahead batches are discarded
+and regenerated from that state; dataset fingerprints describe logical transitions
+and match the former regular-array layout.
 
 | Directory/file (under `src/craft/`) | Responsibility |
 | --- | --- |
