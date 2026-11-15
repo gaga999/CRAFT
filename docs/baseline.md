@@ -20,6 +20,17 @@ after all projections/biases. No inverted-dropout scaling or condition bypass is
 present. Guidance/inference use mask 1. This encourages, but does not guarantee,
 latent usage; compare shuffled/zero latents and condition-on/off reconstruction.
 
+`cvae_representation` (default `critic`) selects the CVAE feature source. `own`
+removes every critic feature from the CVAE: posterior gets its own phi
+`TokenBackbone` and psi-style `MLP+LayerNorm` goal encoder, decoder gets one psi-style
+encoder shared by state and goal, and prior drops the detached psi inputs. Copying
+the replaced architectures keeps each CVAE function class identical, so the ablation
+isolates the representation's training signal (CRL vs. reconstruction/KL). The own
+encoders add trainable CVAE parameters (posterior +555k, decoder +20k at width 128);
+prior loses `2*W*W` input weights. The critic is still trained by CRL and supplies
+the guidance score. `own` is incompatible with `cvae_updates_crl=true`. Checkpoints
+that predate the option are read as `critic`.
+
 ## Objectives and gradient ownership
 
 Following [SigLIP](https://github.com/google-research/big_vision/blob/main/big_vision/trainers/proj/image_text/siglip.py),

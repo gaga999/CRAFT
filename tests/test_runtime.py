@@ -19,7 +19,7 @@ from test_baseline import (
 )
 
 from craft.config import load_config
-from craft.experiments import run_experiment
+from craft.experiments import check_restore, run_experiment
 from craft.utils.checkpoint import pure_state, read_checkpoint, restore_checkpoint
 from craft.utils.logging import Logger
 
@@ -52,12 +52,33 @@ class ConfigTests(unittest.TestCase):
             "seed=-1",
             "data.batch_size=1",
             "data.synthetic=1",
+            "agent.cvae_representation=typo",
+            "agent.cvae_representation=1",
         ]:
             with (
                 self.subTest(override=override),
                 self.assertRaises((ValueError, OmegaConfBaseException)),
             ):
                 load_config("configs/experiment/smoke.yaml", [override])
+
+        with self.assertRaisesRegex(ValueError, "cvae_updates_crl requires"):
+            load_config(
+                "configs/experiment/smoke.yaml",
+                ["agent.cvae_representation=own", "agent.cvae_updates_crl=true"],
+            )
+
+    def test_checkpoints_predating_representation_option_mean_critic(self):
+        config = load_config("configs/experiment/smoke.yaml")
+        saved = {"config": deepcopy(config), "step": 0}
+        del saved["config"]["agent"]["cvae_representation"]
+        check_restore(config, saved, evaluate=False)
+        check_restore(config, saved, evaluate=True)
+        own = load_config(
+            "configs/experiment/smoke.yaml", ["agent.cvae_representation=own"]
+        )
+        for evaluate in (False, True):
+            with self.assertRaisesRegex(ValueError, "mismatch"):
+                check_restore(own, saved, evaluate=evaluate)
 
 
 class RuntimeTests(unittest.TestCase):

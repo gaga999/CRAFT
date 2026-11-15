@@ -116,8 +116,8 @@ class POCTests(unittest.TestCase):
         tokens = self.a.critic.features(s, a)
         self.assertEqual(tokens.shape, (4, 6, 16))
         hg, hs = self.a.critic.encode(g), self.a.critic.encode(s)
-        q = self.a.posterior(tokens, hg)
-        p = self.a.prior(s, g, hs, hg)
+        q = self.a.posterior(s, a, g, (tokens, hg))
+        p = self.a.prior(s, g, (hs, hg))
         for value in (*q, *p):
             self.assertEqual(value.shape, (4, 5, 3))
         key = make_random_engines(3)[1].task_key(1)
@@ -146,7 +146,7 @@ class POCTests(unittest.TestCase):
     def test_ae_gradient_switch(self):
         key = make_random_engines(0)[1].task_key(1)
         s, g = self.b["observations"], self.b["value_goals"]
-        p = self.a.prior(s, g, self.a.critic.encode(s), self.a.critic.encode(g))
+        p = self.a.prior(s, g, (self.a.critic.encode(s), self.a.critic.encode(g)))
         for enabled in (False, True):
             self.a.cvae_updates_crl = enabled
             grad = nnx.grad(
@@ -168,19 +168,23 @@ class POCTests(unittest.TestCase):
         hs, hg = self.a.critic.encode(s), self.a.critic.encode(g)
         z = jnp.ones((4, 5, 3))
         mask = jnp.zeros((4, 1, 1))
-        first = self.a.decoder(z, hs, hg, mask)
-        second = self.a.decoder(z, hs + 2, hg - 3, mask)
+        first = self.a.decoder(z, s, g, mask, (hs, hg))
+        second = self.a.decoder(z, s, g, mask, (hs + 2, hg - 3))
         np.testing.assert_array_equal(first, second)
-        self.assertFalse(np.allclose(first, self.a.decoder(z * 0, hs, hg, mask)))
         self.assertFalse(
-            np.allclose(first, self.a.decoder(z, hs, hg, jnp.ones_like(mask)))
+            np.allclose(first, self.a.decoder(z * 0, s, g, mask, (hs, hg)))
+        )
+        self.assertFalse(
+            np.allclose(first, self.a.decoder(z, s, g, jnp.ones_like(mask), (hs, hg)))
         )
 
     def test_guidance_gradient_through_frozen_decoder_without_clip(self):
         self.a.kl_weight = 0.0
         self.a.decoder.output.bias[...] = jnp.ones(2) * 2
         s, a, g = self.b["observations"], self.b["action_chunks"], self.b["value_goals"]
-        q = self.a.posterior(self.a.critic.features(s, a), self.a.critic.encode(g))
+        q = self.a.posterior(
+            s, a, g, (self.a.critic.features(s, a), self.a.critic.encode(g))
+        )
         before = pure_state(self.a)
         key = make_random_engines(0)[1].task_key(1)
         grad = nnx.grad(lambda p: self.a.prior_objective(p, self.b, q, key)[0])(
@@ -208,7 +212,7 @@ class POCTests(unittest.TestCase):
         self.assertFalse(equal(pure_state(self.a)["prior"], pure_state(other)["prior"]))
         s, g = self.b["observations"], self.b["value_goals"]
         hs, hg = self.a.critic.encode(s), self.a.critic.encode(g)
-        grad = jax.grad(lambda h: self.a.prior(s, g, h, hg)[0].sum())(hs)
+        grad = jax.grad(lambda h: self.a.prior(s, g, (h, hg))[0].sum())(hs)
         np.testing.assert_array_equal(grad, jnp.zeros_like(hs))
 
     def test_validation_is_finite_repeatable_and_read_only(self):
@@ -286,3 +290,138 @@ class POCTests(unittest.TestCase):
         )
         np.testing.assert_allclose(c(s, a, g)[0], expected)
         self.assertFalse(np.allclose(c(s, a, g)[0], c(s, a[:, ::-1].copy(), g)[0]))
+
+
+def norm2(tree):
+    return sum(float(jnp.square(x).sum()) for x in jax.tree.leaves(tree))
+
+
+class OwnRepresentationTests(unittest.TestCase):
+    """`cvae_representation=own`: CVAE never reads critic features."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = load_config(
+            "configs/experiment/smoke.yaml", ["agent.cvae_representation=own"]
+        )["agent"]
+        cls.initial = seeded_agent(0, 6, 2, cls.c)
+        cls.critic_mode = seeded_agent(
+            0, 6, 2, load_config("configs/experiment/smoke.yaml")["agent"]
+        )
+        cls.b = seeded_source()[0].sample(4)
+
+    def setUp(self):
+        self.a = nnx.clone(self.initial)
+
+    def perturbed_critic(self):
+        other = nnx.clone(self.a)
+        state = nnx.state(other.critic, nnx.Param)
+        nnx.update(other.critic, jax.tree.map(lambda x: x + 0.5, state))
+        return other
+
+    def test_cvae_outputs_ignore_critic_parameters(self):
+        other = self.perturbed_critic()
+        s, a, g = self.b["observations"], self.b["action_chunks"], self.b["value_goals"]
+        z = jnp.ones((4, 5, 3))
+        mask = jnp.ones((4, 1, 1))
+        for x, y in (
+            (self.a.posterior(s, a, g), other.posterior(s, a, g)),
+            (self.a.prior(s, g), other.prior(s, g)),
+            (self.a.decoder(z, s, g, mask), other.decoder(z, s, g, mask)),
+        ):
+            self.assertTrue(equal(x, y))
+        key = make_random_engines(3)[1].task_key(1)
+        np.testing.assert_array_equal(
+            self.a.sample_action_chunk(s, g, key), other.sample_action_chunk(s, g, key)
+        )
+        mine, theirs = (x.validation_metrics(self.b, key) for x in (self.a, other))
+        for name in mine:
+            if "/vae/" in name:
+                self.assertEqual(float(mine[name]), float(theirs[name]), name)
+        self.assertNotEqual(
+            float(mine["validation/critic/loss"]),
+            float(theirs["validation/critic/loss"]),
+        )
+
+    def test_ae_gradients_reach_own_encoders_not_critic(self):
+        key = make_random_engines(0)[1].task_key(1)
+        s, g = self.b["observations"], self.b["value_goals"]
+        p = self.a.prior(s, g)
+        critic, posterior, decoder = nnx.grad(
+            lambda c, q, d: self.a.ae_objective(
+                c, q, d, self.b, key, jnp.ones((4, 1, 1)), p
+            )[0],
+            argnums=(0, 1, 2),
+        )(self.a.critic, self.a.posterior, self.a.decoder)
+        self.assertEqual(norm2(critic), 0)
+        for name, grad in (
+            ("posterior.backbone", posterior.backbone),
+            ("posterior.goal_encoder", posterior.goal_encoder),
+            ("decoder.encoder", decoder.encoder),
+        ):
+            self.assertGreater(norm2(grad), 0, name)
+
+    def test_guidance_uses_critic_score_and_updates_only_prior(self):
+        key = make_random_engines(0)[1].task_key(1)
+        s, a, g = self.b["observations"], self.b["action_chunks"], self.b["value_goals"]
+        q = self.a.posterior(s, a, g)
+        self.a.kl_weight = 0.0
+
+        def prior_grad(agent):
+            return nnx.grad(lambda p: agent.prior_objective(p, self.b, q, key)[0])(
+                agent.prior
+            )
+
+        grad = prior_grad(self.a)
+        self.assertGreater(norm2(grad), 0)
+        other = self.perturbed_critic()
+        other.kl_weight = 0.0
+        self.assertFalse(equal(grad, prior_grad(other)))
+        self.a.kl_weight = self.initial.kl_weight
+        guided, unguided = nnx.clone(self.a), nnx.clone(self.a)
+        unguided.guidance_enabled = False
+        guided.update(self.b)
+        unguided.update(self.b)
+        for role in ("critic", "posterior", "decoder"):
+            self.assertTrue(
+                equal(pure_state(guided)[role], pure_state(unguided)[role]), role
+            )
+        self.assertFalse(
+            equal(pure_state(guided)["prior"], pure_state(unguided)["prior"])
+        )
+
+    def test_update_changes_all_modules_and_checkpoint_resumes(self):
+        before = pure_state(self.a)
+        metrics = self.a.update(self.b)
+        self.assertTrue(bool(metrics["numerics/finite"]))
+        self.assertTrue(all(np.isfinite(x) for x in metrics.values()))
+        after = pure_state(self.a)
+        for role in ("critic", "posterior", "decoder", "prior"):
+            self.assertFalse(equal(before[role], after[role]), role)
+        for role, name in (
+            ("posterior", "backbone"),
+            ("posterior", "goal_encoder"),
+            ("decoder", "encoder"),
+        ):
+            self.assertFalse(equal(before[role][name], after[role][name]), name)
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "cp"
+            save_checkpoint(path, agent=self.a, run_state={})
+            other = nnx.clone(self.initial)
+            restore_checkpoint(path, agent=other)
+            self.a.update(self.b)
+            other.update(self.b)
+            self.assertTrue(equal(pure_state(self.a), pure_state(other)))
+            with self.assertRaises(ValueError):
+                restore_checkpoint(path, agent=nnx.clone(self.critic_mode))
+
+    def test_feature_contract_is_explicit(self):
+        s, a, g = self.b["observations"], self.b["action_chunks"], self.b["value_goals"]
+        critic = self.critic_mode
+        hs, hg = critic.critic.encode(s), critic.critic.encode(g)
+        with self.assertRaisesRegex(ValueError, "rejects"):
+            self.a.prior(s, g, (hs, hg))
+        with self.assertRaisesRegex(ValueError, "requires"):
+            critic.decoder(jnp.ones((4, 5, 3)), s, g, jnp.ones((4, 1, 1)))
+        with self.assertRaisesRegex(ValueError, "requires"):
+            critic.posterior(s, a, g)

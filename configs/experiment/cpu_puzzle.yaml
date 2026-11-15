@@ -13,6 +13,7 @@ agent:
   guide_weight: 0.4
   guidance_enabled: true
   cvae_updates_crl: false
+  cvae_representation: critic
   condition_drop_prob: 0.2
   log_std_min: -4.0
   log_std_max: 1.0

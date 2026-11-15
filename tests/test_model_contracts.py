@@ -97,7 +97,9 @@ class CalibrationTests(unittest.TestCase):
         s, a, g = (
             self.batch[k] for k in ("observations", "action_chunks", "value_goals")
         )
-        q = agent.posterior(agent.critic.features(s, a), agent.critic.encode(g))
+        q = agent.posterior(
+            s, a, g, (agent.critic.features(s, a), agent.critic.encode(g))
+        )
         key = self.evaluation.task_key(0)
 
         def loss(prior):
@@ -139,8 +141,11 @@ class CalibrationTests(unittest.TestCase):
             decoder.log_gate[...] = jnp.array(log_gate)
             self.assertGreater(float(decoder.gate), 0)
             np.testing.assert_array_equal(
-                decoder(z, hs, hg, off), decoder(z, hs + 3, hg - 4, off)
+                decoder(z, None, None, off, (hs, hg)),
+                decoder(z, None, None, off, (hs + 3, hg - 4)),
             )
-        grad = nnx.grad(lambda d: jnp.square(d(z, hs, hg, on)).sum())(decoder)
+        grad = nnx.grad(lambda d: jnp.square(d(z, None, None, on, (hs, hg))).sum())(
+            decoder
+        )
         self.assertTrue(np.isfinite(grad.log_gate[...]))
         self.assertNotEqual(float(grad.log_gate[...]), 0)

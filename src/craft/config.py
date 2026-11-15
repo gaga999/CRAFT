@@ -6,6 +6,7 @@ from pathlib import Path
 
 from omegaconf import OmegaConf
 
+REPRESENTATIONS = ("critic", "own")
 
 @dataclass
 class AgentConfig:
@@ -22,6 +23,7 @@ class AgentConfig:
     guide_weight: float = 0.1
     guidance_enabled: bool = True
     cvae_updates_crl: bool = False
+    cvae_representation: str = "critic"
     condition_drop_prob: float = 0.2
     log_std_min: float = -4.0
     log_std_max: float = 1.0
@@ -126,6 +128,13 @@ def validate_agent(config):
     for key in ("guidance_enabled", "cvae_updates_crl"):
         if type(config[key]) is not bool:
             raise ValueError(f"{key} must be boolean")
+    if config["cvae_representation"] not in REPRESENTATIONS:
+        raise ValueError(f"cvae_representation must be one of {REPRESENTATIONS}")
+    if config["cvae_representation"] == "own" and config["cvae_updates_crl"]:
+        raise ValueError(
+            "cvae_updates_crl requires cvae_representation=critic; own CVAE encoders"
+            " share no features with the critic"
+        )
 
 
 def load_config(path, overrides=()):

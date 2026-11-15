@@ -9,7 +9,7 @@ from flax import nnx
 
 from craft.losses.contrastive import contrastive_loss
 from craft.losses.cvae import gaussian_kl
-from craft.models.cvae import sample_gaussian
+from craft.models.cvae import critic_condition, sample_gaussian
 from craft.models.factory import make_poc_models
 from craft.policies.chunk import sample_action_chunk
 
@@ -31,6 +31,7 @@ class CRAFTAgent(nnx.Module):
             config["cvae_updates_crl"],
         )
         self.condition_drop_prob = config["condition_drop_prob"]
+        self.representation = config["cvae_representation"]
         self.optimizers = nnx.List(
             [
                 nnx.Optimizer(
@@ -68,25 +69,26 @@ class CRAFTAgent(nnx.Module):
         self, critic, posterior, decoder, batch, key, mask, prior_parameters
     ):
         s, a, g = batch["observations"], batch["action_chunks"], batch["value_goals"]
-        tokens, hg, hs = critic.features(s, a), critic.encode(g), critic.encode(s)
-        if not self.cvae_updates_crl:
-            tokens, hg, hs = jax.tree.map(jax.lax.stop_gradient, (tokens, hg, hs))
-        q = posterior(tokens, hg)
-        reconstruction = decoder(sample_gaussian(q, key), hs, hg, mask)
+        posterior_features = condition = None
+        if self.representation == "critic":
+            tokens, hg, hs = critic.features(s, a), critic.encode(g), critic.encode(s)
+            if not self.cvae_updates_crl:
+                tokens, hg, hs = jax.tree.map(jax.lax.stop_gradient, (tokens, hg, hs))
+            posterior_features, condition = (tokens, hg), (hs, hg)
+        q = posterior(s, a, g, posterior_features)
+        reconstruction = decoder(sample_gaussian(q, key), s, g, mask, condition)
         rec = jnp.square(reconstruction - a).mean()
         kl = gaussian_kl(q, prior_parameters)
         return rec + self.kl_weight * kl, (rec, kl, q)
 
     def prior_objective(self, prior, batch, q, key):
         s, g = batch["observations"], batch["value_goals"]
-        hs, hg = jax.tree.map(
-            jax.lax.stop_gradient, (self.critic.encode(s), self.critic.encode(g))
-        )
-        p = prior(s, g, hs, hg)
+        condition = critic_condition(self.critic, self.representation, s, g)
+        p = prior(s, g, condition)
         kl = gaussian_kl(jax.tree.map(jax.lax.stop_gradient, q), p)
         # No hard clip: decoder's differentiable tanh output is already bounded.
         actions = self.decoder(
-            sample_gaussian(p, key), hs, hg, jnp.ones((s.shape[0], 1, 1))
+            sample_gaussian(p, key), s, g, jnp.ones((s.shape[0], 1, 1)), condition
         )
         guide = (
             -self.critic.score(s, actions, g).mean()
@@ -109,10 +111,8 @@ class CRAFTAgent(nnx.Module):
             )
 
         (_, metrics), cg = nnx.value_and_grad(crl, has_aux=True)(self.critic)
-        hs, hg = jax.tree.map(
-            jax.lax.stop_gradient, (self.critic.encode(s), self.critic.encode(g))
-        )
-        pp = jax.tree.map(jax.lax.stop_gradient, self.prior(s, g, hs, hg))
+        condition = critic_condition(self.critic, self.representation, s, g)
+        pp = jax.tree.map(jax.lax.stop_gradient, self.prior(s, g, condition))
         mask = jax.random.bernoulli(
             mkey, 1 - self.condition_drop_prob, (s.shape[0], 1, 1)
         ).astype(s.dtype)
@@ -207,7 +207,13 @@ class CRAFTAgent(nnx.Module):
     @nnx.jit
     def sample_action_chunk(self, observations, goals, rng):
         return sample_action_chunk(
-            self.critic, self.prior, self.decoder, observations, goals, rng
+            self.critic,
+            self.prior,
+            self.decoder,
+            observations,
+            goals,
+            rng,
+            representation=self.representation,
         )
 
     @nnx.jit
@@ -217,14 +223,17 @@ class CRAFTAgent(nnx.Module):
             *self.critic(s, a, g), self.critic.log_scale[...], self.critic.bias[...]
         )
         qkey, pkey = jax.random.split(key)
-        hs, hg = self.critic.encode(s), self.critic.encode(g)
-        q = self.posterior(self.critic.features(s, a), hg)
-        p = self.prior(s, g, hs, hg)
+        condition = critic_condition(self.critic, self.representation, s, g)
+        posterior_features = (
+            None if condition is None else (self.critic.features(s, a), condition[1])
+        )
+        q = self.posterior(s, a, g, posterior_features)
+        p = self.prior(s, g, condition)
         z = sample_gaussian(q, qkey)
         mask = jnp.ones((s.shape[0], 1, 1))
-        reconstructed = self.decoder(z, hs, hg, mask)
-        sampled = self.decoder(sample_gaussian(p, pkey), hs, hg, mask)
-        shuffled = self.decoder(jnp.roll(z, 1, axis=0), hs, hg, mask)
+        reconstructed = self.decoder(z, s, g, mask, condition)
+        sampled = self.decoder(sample_gaussian(p, pkey), s, g, mask, condition)
+        shuffled = self.decoder(jnp.roll(z, 1, axis=0), s, g, mask, condition)
         metrics.update(
             {
                 "vae/reconstruction": jnp.square(reconstructed - a).mean(),

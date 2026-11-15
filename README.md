@@ -70,6 +70,9 @@ reconstruction plus Gaussian KL; prior KL plus SigLIP-logit critic guidance
 updates only prior weights, differentiating THROUGH fixed decoder/critic weights.
 No hard action clip is used in training or guidance; tanh bounds decoder outputs.
 CVAE-to-CRL gradients are optional (`agent.cvae_updates_crl`, default false).
+`agent.cvae_representation=own` is the representation ablation: posterior/decoder
+use their own copies of the critic encoders and prior uses raw state/goal only, while
+guidance still maximizes the critic score (default `critic` is the diagram above).
 See [method details](docs/baseline.md) and [contracts](docs/interfaces.md).
 
 ## Outputs and resume

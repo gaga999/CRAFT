@@ -16,7 +16,7 @@ def make_poc_models(config, observation_dim, action_dim, *, rngs, batch_size):
     )
     return (
         critic,
-        Posterior(config, rngs=rngs),
-        Decoder(action_dim, config, rngs=rngs),
+        Posterior(observation_dim, action_dim, config, rngs=rngs),
+        Decoder(observation_dim, action_dim, config, rngs=rngs),
         Prior(observation_dim, config, rngs=rngs),
     )

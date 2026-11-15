@@ -1,11 +1,17 @@
-"""Token-wise conditional VAE; Gaussian latents exist at every action position."""
+"""Token-wise conditional VAE; Gaussian latents exist at every action position.
+
+`cvae_representation` selects where CVAE features come from. "critic": callers pass
+critic features. "own": posterior/decoder encode raw inputs with their own copies of
+the critic architecture they replace, so only the representation's training signal
+differs; prior uses only raw state/goal.
+"""
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
 
 from craft.models.mlp import MLP
-from craft.models.tokens import MixerBlock
+from craft.models.tokens import MixerBlock, TokenBackbone
 
 
 class TokenMixer(nnx.Module):
@@ -45,9 +51,51 @@ def sample_gaussian(parameters, key):
     return mean + jnp.exp(log_std) * jax.random.normal(key, mean.shape)
 
 
+class StateEncoder(nnx.Module):
+    """Same function class as the critic's psi feature path (`critic.encode`)."""
+
+    def __init__(self, observation_dim, width, *, rngs):
+        self.features = MLP(observation_dim, (width,), width, rngs=rngs)
+        self.norm = nnx.LayerNorm(width, rngs=rngs)
+
+    def __call__(self, states):
+        return self.norm(self.features(states))
+
+
+def critic_condition(critic, representation, states, goals):
+    """Detached critic state/goal features for "critic" CVAEs; None for "own"."""
+    if representation == "own":
+        return None
+    return jax.tree.map(
+        jax.lax.stop_gradient, (critic.encode(states), critic.encode(goals))
+    )
+
+
+def _check_features(module, features):
+    if (features is None) != (module.representation == "own"):
+        raise ValueError(
+            f"{type(module).__name__} with cvae_representation="
+            f"{module.representation!r} {'rejects' if features is not None else 'requires'}"
+            " critic features"
+        )
+
+
 class Posterior(nnx.Module):
-    def __init__(self, config, *, rngs):
+    def __init__(self, observation_dim, action_dim, config, *, rngs):
         w, h = config["width"], config["chunk_length"]
+        self.representation = config["cvae_representation"]
+        if self.representation == "own":
+            # Mirrors critic.features (phi backbone) and critic.encode (psi).
+            self.backbone = TokenBackbone(
+                observation_dim,
+                action_dim,
+                h,
+                width=w,
+                depth=config["depth"],
+                exchange_every=config["exchange_every"],
+                rngs=rngs,
+            )
+            self.goal_encoder = StateEncoder(observation_dim, w, rngs=rngs)
         self.action_projection = nnx.Linear(w, w, rngs=rngs)
         self.goal_projection = nnx.Linear(w, w, rngs=rngs)
         self.mixer = TokenMixer(
@@ -61,7 +109,12 @@ class Posterior(nnx.Module):
             rngs=rngs,
         )
 
-    def __call__(self, tokens, goal):
+    def __call__(self, states, actions, goals, features=None):
+        """features: (critic.features(s, a) [B,H+1,W], critic.encode(g) [B,W])."""
+        _check_features(self, features)
+        if features is None:
+            features = self.backbone(states, actions), self.goal_encoder(goals)
+        tokens, goal = features
         x = jnp.concatenate(
             [self.action_projection(tokens), self.goal_projection(goal)[:, None]],
             axis=1,
@@ -73,25 +126,33 @@ class Prior(nnx.Module):
     def __init__(self, observation_dim, config, *, rngs):
         self.h, self.z = config["chunk_length"], config["vae_latent_dim"]
         w = config["width"]
-        self.body = MLP(2 * observation_dim + 2 * w, (w, w), self.h * w, rngs=rngs)
+        self.representation = config["cvae_representation"]
+        features = 2 * w if self.representation == "critic" else 0
+        self.body = MLP(2 * observation_dim + features, (w, w), self.h * w, rngs=rngs)
         self.head = GaussianHead(
             w, self.z, config["log_std_min"], config["log_std_max"], rngs=rngs
         )
         self.width = w
 
-    def __call__(self, states, goals, state_features, goal_features):
-        features = jax.lax.stop_gradient(
-            jnp.concatenate([state_features, goal_features], -1)
-        )
-        condition = jnp.concatenate([states, goals, features], -1)
+    def __call__(self, states, goals, features=None):
+        """features: (critic.encode(s), critic.encode(g)), always detached here."""
+        _check_features(self, features)
+        condition = [states, goals]
+        if features is not None:
+            condition += [jax.lax.stop_gradient(x) for x in features]
+        condition = jnp.concatenate(condition, -1)
         return self.head(
             self.body(condition).reshape(states.shape[0], self.h, self.width)
         )
 
 
 class Decoder(nnx.Module):
-    def __init__(self, action_dim, config, *, rngs):
+    def __init__(self, observation_dim, action_dim, config, *, rngs):
         w, h = config["width"], config["chunk_length"]
+        self.representation = config["cvae_representation"]
+        if self.representation == "own":
+            # Shared for state and goal, like critic.encode.
+            self.encoder = StateEncoder(observation_dim, w, rngs=rngs)
         self.state_condition = nnx.Linear(w, w, rngs=rngs)
         self.goal_condition = nnx.Linear(w, w, rngs=rngs)
         self.condition = nnx.Linear(w, w, rngs=rngs)
@@ -111,7 +172,12 @@ class Decoder(nnx.Module):
     def gate(self):
         return jnp.exp(self.log_gate[...])
 
-    def __call__(self, z, state_features, goal_features, mask):
+    def __call__(self, z, states, goals, mask, features=None):
+        """features: (critic.encode(s), critic.encode(g)) for "critic" decoders."""
+        _check_features(self, features)
+        if features is None:
+            features = self.encoder(states), self.encoder(goals)
+        state_features, goal_features = features
         c = self.state_condition(state_features) + self.goal_condition(goal_features)
         # Mask AFTER every condition projection, including biases; no bypass tokens.
         injected = mask * self.gate * self.condition(c)[:, None]
