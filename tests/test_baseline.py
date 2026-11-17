@@ -198,6 +198,34 @@ class POCTests(unittest.TestCase):
             sum(float(jnp.square(x).sum()) for x in jax.tree.leaves(grad)), 0
         )
 
+    def test_anchor_pulls_only_prior_mean_toward_zero(self):
+        self.a.kl_weight = 0.0
+        self.a.guidance_enabled = False
+        s, a, g = self.b["observations"], self.b["action_chunks"], self.b["value_goals"]
+        q = self.a.posterior(self.a.critic.features(s, a), self.a.critic.encode(g))
+        key = make_random_engines(0)[1].task_key(1)
+
+        def objective(prior):
+            return self.a.prior_objective(prior, self.b, q, key)[0]
+
+        self.assertEqual(
+            sum(float(jnp.square(x).sum()) for x in jax.tree.leaves(nnx.grad(objective)(self.a.prior))),
+            0,
+        )
+        self.a.anchor_weight = 1.0
+        _, (_, _, anchor) = self.a.prior_objective(self.a.prior, self.b, q, key)
+        mean = self.a.prior(s, g, self.a.critic.encode(s), self.a.critic.encode(g))[0]
+        np.testing.assert_allclose(
+            anchor, jnp.square(mean).sum(axis=(-1, -2)).mean(), rtol=1e-6
+        )
+        other = nnx.clone(self.a)
+        other.anchor_weight = 0.0
+        self.a.update(self.b)
+        other.update(self.b)
+        for role in ("critic", "posterior", "decoder"):
+            self.assertTrue(equal(pure_state(self.a)[role], pure_state(other)[role]))
+        self.assertFalse(equal(pure_state(self.a)["prior"], pure_state(other)["prior"]))
+
     def test_guidance_changes_only_prior_updates(self):
         other = nnx.clone(self.a)
         other.guidance_enabled = False

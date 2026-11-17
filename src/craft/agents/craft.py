@@ -26,6 +26,7 @@ class CRAFTAgent(nnx.Module):
         self.observation_dim, self.action_dim = observation_dim, action_dim
         self.chunk_length = config["chunk_length"]
         self.kl_weight, self.guide_weight = config["kl_weight"], config["guide_weight"]
+        self.anchor_weight = config["anchor_weight"]
         self.guidance_enabled, self.cvae_updates_crl = (
             config["guidance_enabled"],
             config["cvae_updates_crl"],
@@ -93,7 +94,11 @@ class CRAFTAgent(nnx.Module):
             if self.guidance_enabled
             else jnp.array(0.0)
         )
-        return self.kl_weight * kl + self.guide_weight * guide, (kl, guide)
+        anchor = jnp.square(p[0]).sum(axis=(-1, -2)).mean()
+        return (
+            self.kl_weight * kl + self.guide_weight * guide + self.anchor_weight * anchor,
+            (kl, guide, anchor),
+        )
 
     @partial(nnx.jit, static_argnames=("stage",))
     def update(self, batch, *, stage="joint"):
@@ -125,18 +130,17 @@ class CRAFTAgent(nnx.Module):
         )(self.critic, self.posterior, self.decoder)
 
         def prior_terms(p):
-            _, (pkl, guide) = self.prior_objective(p, batch, q, pkey)
-            return jnp.stack([self.kl_weight * pkl, self.guide_weight * guide]), (
-                pkl,
-                guide,
-            )
+            _, (pkl, guide, anchor) = self.prior_objective(p, batch, q, pkey)
+            terms = [self.kl_weight * pkl, self.guide_weight * guide]
+            return jnp.stack(terms + [self.anchor_weight * anchor]), (pkl, guide, anchor)
 
-        terms, backward, (pkl, guide) = nnx.vjp(
+        terms, backward, (pkl, guide, anchor) = nnx.vjp(
             prior_terms, self.prior, has_aux=True, graph_updates=False
         )
-        kg = backward(jnp.array([1.0, 0.0]))[0]
-        gg = backward(jnp.array([0.0, 1.0]))[0]
-        rg = jax.tree.map(lambda x, y: x + y, kg, gg)
+        kg = backward(jnp.array([1.0, 0.0, 0.0]))[0]
+        gg = backward(jnp.array([0.0, 1.0, 0.0]))[0]
+        ag = backward(jnp.array([0.0, 0.0, 1.0]))[0]
+        rg = jax.tree.map(lambda x, y, z: x + y + z, kg, gg, ag)
         if stage == "joint":
             cg = jax.tree.map(lambda x, y: x + y, cg, acg)
         metrics.update(
@@ -148,6 +152,10 @@ class CRAFTAgent(nnx.Module):
                 "prior/grad_norm": optax.tree.norm(rg),
                 "prior/weighted_kl": terms[0],
                 "prior/weighted_guidance": terms[1],
+                "prior/anchor": anchor,
+                "prior/weighted_anchor": terms[2],
+                "prior/mean_rms": jnp.sqrt(jnp.square(pp[0]).mean()),
+                "vae/posterior_mean_rms": jnp.sqrt(jnp.square(q[0]).mean()),
                 "prior/kl_grad_norm": optax.tree.norm(kg),
                 "prior/guide_grad_norm": optax.tree.norm(gg),
                 "prior/guide_to_kl_grad_ratio": optax.tree.norm(gg)

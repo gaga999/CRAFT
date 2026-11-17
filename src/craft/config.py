@@ -20,6 +20,9 @@ class AgentConfig:
     prior_learning_rate: float = 0.0001
     kl_weight: float = 0.01
     guide_weight: float = 0.1
+    # L2 pull of the prior mean toward 0: the q/p KL is translation-invariant,
+    # so without it guidance can drift the whole latent space unboundedly.
+    anchor_weight: float = 0.0
     guidance_enabled: bool = True
     cvae_updates_crl: bool = False
     condition_drop_prob: float = 0.2
@@ -113,7 +116,7 @@ def validate_agent(config):
         positive_int(config[key], f"agent.{key}")
     for key in ("learning_rate", "prior_learning_rate", "max_grad_norm"):
         finite_float(config[key], f"agent.{key}")
-    for key in ("kl_weight", "guide_weight", "condition_drop_prob"):
+    for key in ("kl_weight", "guide_weight", "anchor_weight", "condition_drop_prob"):
         finite_float(config[key], key, strict=False)
     if config["condition_drop_prob"] > 1:
         raise ValueError("condition_drop_prob must be <= 1")
