@@ -202,6 +202,27 @@ class POCTests(unittest.TestCase):
             sum(float(jnp.square(x).sum()) for x in jax.tree.leaves(grad)), 0
         )
 
+    def test_guidance_reaches_prior_std_only_when_configured(self):
+        self.a.kl_weight = 0.0
+        s, a, g = self.b["observations"], self.b["action_chunks"], self.b["value_goals"]
+        q = self.a.posterior(
+            s, a, g, (self.a.critic.features(s, a), self.a.critic.encode(g))
+        )
+        key = make_random_engines(0)[1].task_key(1)
+        z = self.c["vae_latent_dim"]
+
+        def head_bias_grad():
+            grad = nnx.grad(lambda p: self.a.prior_objective(p, self.b, q, key)[0])(
+                self.a.prior
+            )
+            return grad["head"]["output"]["bias"][...]
+
+        detached = head_bias_grad()
+        self.assertGreater(float(jnp.abs(detached[:z]).sum()), 0)
+        np.testing.assert_array_equal(detached[z:], jnp.zeros(z))
+        self.a.guide_through_std = True
+        self.assertGreater(float(jnp.abs(head_bias_grad()[z:]).sum()), 0)
+
     def test_guidance_changes_only_prior_updates(self):
         other = nnx.clone(self.a)
         other.guidance_enabled = False

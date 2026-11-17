@@ -19,7 +19,8 @@
   Gate is applied after condition projection, including biases. No raw condition
   tokens bypass dropout. Posterior features may receive AE gradients by config.
 - Agent update mutates NNX state; prior-only guidance must not update decoder or
-  critic weights. No hard clip or stop-gradient may break the guide input path.
+  critic weights. No hard clip or stop-gradient may break the guide input path, except the prior
+  log std detached when `guide_through_std=false` (default).
 - Inference composes prior, sample, decoder; no posterior or dataset action needed.
 - RNG engines, dataset fingerprints, checkpoint atomicity and independent evaluation
   follow the README. New runs add a unique suffix; resume uses the saved actual path.

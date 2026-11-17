@@ -34,8 +34,9 @@ def check_restore(config, saved, *, evaluate):
 
     def contract(value, key):
         if key == "agent":
-            # Checkpoints predating the option always used critic features.
-            return {"cvae_representation": "critic", **value}
+            # Checkpoints predating these options used critic features and
+            # sent guidance gradients through the prior std.
+            return {"cvae_representation": "critic", "guide_through_std": True, **value}
         if key == "data":
             return {
                 k: v

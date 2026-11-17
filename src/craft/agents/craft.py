@@ -30,6 +30,7 @@ class CRAFTAgent(nnx.Module):
             config["guidance_enabled"],
             config["cvae_updates_crl"],
         )
+        self.guide_through_std = config["guide_through_std"]
         self.condition_drop_prob = config["condition_drop_prob"]
         self.representation = config["cvae_representation"]
         self.optimizers = nnx.List(
@@ -86,9 +87,17 @@ class CRAFTAgent(nnx.Module):
         condition = critic_condition(self.critic, self.representation, s, g)
         p = prior(s, g, condition)
         kl = gaussian_kl(jax.tree.map(jax.lax.stop_gradient, q), p)
+
+        mean, log_std = p
+        if not self.guide_through_std:
+            log_std = jax.lax.stop_gradient(log_std)
         # No hard clip: decoder's differentiable tanh output is already bounded.
         actions = self.decoder(
-            sample_gaussian(p, key), s, g, jnp.ones((s.shape[0], 1, 1)), condition
+            sample_gaussian((mean, log_std), key),
+            s,
+            g,
+            jnp.ones((s.shape[0], 1, 1)),
+            condition,
         )
         guide = (
             -self.critic.score(s, actions, g).mean()

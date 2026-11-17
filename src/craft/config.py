@@ -22,6 +22,7 @@ class AgentConfig:
     kl_weight: float = 0.01
     guide_weight: float = 0.1
     guidance_enabled: bool = True
+    guide_through_std: bool = False
     cvae_updates_crl: bool = False
     cvae_representation: str = "critic"
     condition_drop_prob: float = 0.2
@@ -125,7 +126,7 @@ def validate_agent(config):
         or not -10 <= config["log_std_min"] < 0 < config["log_std_max"] <= 3
     ):
         raise ValueError("log_std bounds must be finite: -10 <= min < 0 < max <= 3")
-    for key in ("guidance_enabled", "cvae_updates_crl"):
+    for key in ("guidance_enabled", "guide_through_std", "cvae_updates_crl"):
         if type(config[key]) is not bool:
             raise ValueError(f"{key} must be boolean")
     if config["cvae_representation"] not in REPRESENTATIONS:

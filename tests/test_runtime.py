@@ -67,14 +67,21 @@ class ConfigTests(unittest.TestCase):
                 ["agent.cvae_representation=own", "agent.cvae_updates_crl=true"],
             )
 
-    def test_checkpoints_predating_representation_option_mean_critic(self):
+    def test_checkpoints_predating_agent_options_keep_old_behavior(self):
         config = load_config("configs/experiment/smoke.yaml")
         saved = {"config": deepcopy(config), "step": 0}
         del saved["config"]["agent"]["cvae_representation"]
+        del saved["config"]["agent"]["guide_through_std"]
+        for evaluate in (False, True):
+            # Old checkpoints sent guidance through the std.
+            with self.assertRaisesRegex(ValueError, "mismatch"):
+                check_restore(config, saved, evaluate=evaluate)
+        config["agent"]["guide_through_std"] = True
         check_restore(config, saved, evaluate=False)
         check_restore(config, saved, evaluate=True)
         own = load_config(
-            "configs/experiment/smoke.yaml", ["agent.cvae_representation=own"]
+            "configs/experiment/smoke.yaml",
+            ["agent.cvae_representation=own", "agent.guide_through_std=true"],
         )
         for evaluate in (False, True):
             with self.assertRaisesRegex(ValueError, "mismatch"):

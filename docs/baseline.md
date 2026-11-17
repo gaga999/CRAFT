@@ -50,7 +50,14 @@ extra sigmoid. Scale multiplies the prior guidance gradient; the fixed critic bi
 shifts the loss but has no prior gradient. Guide weight remains untuned.
 These are the separate parameter derivatives of one KL, not double its weight.
 Guide gradients update ONLY prior weights; fixed decoder/critic still transmit
-input gradients. Conditions for prior are always detached. `cvae_updates_crl`
+input gradients. By default (`guide_through_std=false`) the guide sample uses a
+detached prior log std, so guidance moves only the prior mean and KL alone sets the
+std. With gradients through the std, a cube-single-noisy run drove prior std to
+`exp(log_std_max)` within ~20k steps; the posterior followed, its saturated std
+stopped learning, and validation reconstruction rose 0.10 -> 0.20 as the decoder
+stopped using latents. Guidance still widens the prior indirectly: KL's optimal
+prior variance is posterior variance plus squared mean gap. Monitor `prior/std`.
+Checkpoints that predate the option are read as `guide_through_std=true`. Conditions for prior are always detached. `cvae_updates_crl`
 controls only AE-to-backbone gradients. All groups use pre-update parameters.
 
 Default beta=0.01, guide_weight=0.1, latent=16 PER action, width/projection=128,

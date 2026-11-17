@@ -67,7 +67,8 @@ features. There is no FQL teacher or student.
 Losses: sigmoid CRL with learned positive scale and signed bias; posterior
 reconstruction plus Gaussian KL; prior KL plus SigLIP-logit critic guidance
 (enabled by default). Guidance
-updates only prior weights, differentiating THROUGH fixed decoder/critic weights.
+updates only prior weights, differentiating THROUGH fixed decoder/critic weights,
+and only the prior mean unless `agent.guide_through_std=true`.
 No hard action clip is used in training or guidance; tanh bounds decoder outputs.
 CVAE-to-CRL gradients are optional (`agent.cvae_updates_crl`, default false).
 `agent.cvae_representation=own` is the representation ablation: posterior/decoder
