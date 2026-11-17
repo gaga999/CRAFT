@@ -72,6 +72,25 @@ No hard action clip is used in training or guidance; tanh bounds decoder outputs
 CVAE-to-CRL gradients are optional (`agent.cvae_updates_crl`, default false).
 See [method details](docs/baseline.md) and [contracts](docs/interfaces.md).
 
+## Prior anchor (latent drift)
+
+The posterior/prior KL is translation-invariant, and guidance pushes the prior mean
+in a consistent direction, so with guidance the whole latent space drifts without
+bound. On `cube-single-noisy-v0` the latent mean reached ~1900 after 690k steps,
+both stds pinned at `e^log_std_max`, reconstruction rose and the decoder gate grew
+to compensate. `agent.anchor_weight` adds `anchor_weight * sum(mu_p^2)` to the prior
+objective (default 0 keeps the previous behavior). `prior/mean_rms` and
+`vae/posterior_mean_rms` are logged to watch the drift.
+
+```bash
+# 300k steps, evaluation at 150k and 300k
+uv run --extra cuda craft --config configs/experiment/anchor_1e-3.yaml
+uv run --extra cuda craft --config configs/experiment/anchor_1e-2.yaml
+```
+
+Partial result (one seed, ~115k steps): both weights keep the latent mean below 0.5
+and reconstruction near the no-guidance run; success rate not yet measured.
+
 ## Outputs and resume
 
 `output_dir` is a **prefix**, e.g. `runs/cube_single_noisy-<UTC>-<UUID>`. The resolved
