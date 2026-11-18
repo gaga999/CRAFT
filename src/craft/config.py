@@ -13,18 +13,16 @@ class AgentConfig:
     width: int = 128
     depth: int = 4
     exchange_every: int = 2
-    latent_dim: int = 128
+    embedding_dim: int = 128
+    latent_dim: int = 8
+    decoder_depth: int = 2
+    actor_width: int = 256
+    actor_depth: int = 3
+    reconstruction_weight: float = 1.0
+    bc_weight: float = 10.0
+    latent_noise: float = 0.2
     learning_rate: float = 0.0003
-    vae_latent_dim: int = 16
-    fusion_depth: int = 2
-    prior_learning_rate: float = 0.0001
-    kl_weight: float = 0.01
-    guide_weight: float = 0.1
-    guidance_enabled: bool = True
-    cvae_updates_crl: bool = False
-    condition_drop_prob: float = 0.2
-    log_std_min: float = -4.0
-    log_std_max: float = 1.0
+    actor_learning_rate: float = 0.0003
     max_grad_norm: float = 10.0
 
 
@@ -63,6 +61,12 @@ class EvaluationConfig:
 
 
 @dataclass
+class InitConfig:
+    checkpoint: str | None = None
+    modules: list[str] = field(default_factory=lambda: ["representation", "actor"])
+
+
+@dataclass
 class LoggingConfig:
     backend: str = "console"
     project: str = "craft"
@@ -76,6 +80,7 @@ class ExperimentConfig:
     data: DataConfig = field(default_factory=DataConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
+    init: InitConfig = field(default_factory=InitConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
 
@@ -99,33 +104,25 @@ def validate_agent(config):
     expected = set(OmegaConf.to_container(OmegaConf.structured(AgentConfig)))
     if set(config) != expected:
         raise ValueError(
-            f"Agent configuration keys differ: {set(config) ^ expected}. Use the CVAE POC schema; FQL configs are incompatible."
+            f"Agent configuration keys differ: {set(config) ^ expected}. CVAE/prior configs are incompatible with the latent-actor schema."
         )
     for key in (
         "chunk_length",
         "width",
         "depth",
         "exchange_every",
-        "latent_dim",
-        "vae_latent_dim",
-        "fusion_depth",
+        "embedding_dim",
+        "decoder_depth",
+        "actor_width",
+        "actor_depth",
     ):
         positive_int(config[key], f"agent.{key}")
-    for key in ("learning_rate", "prior_learning_rate", "max_grad_norm"):
+    # Normalized latents have Z-2 degrees of freedom per action token.
+    positive_int(config["latent_dim"], "agent.latent_dim", 3)
+    for key in ("learning_rate", "actor_learning_rate", "max_grad_norm"):
         finite_float(config[key], f"agent.{key}")
-    for key in ("kl_weight", "guide_weight", "condition_drop_prob"):
-        finite_float(config[key], key, strict=False)
-    if config["condition_drop_prob"] > 1:
-        raise ValueError("condition_drop_prob must be <= 1")
-    if (
-        not math.isfinite(config["log_std_min"])
-        or not math.isfinite(config["log_std_max"])
-        or not -10 <= config["log_std_min"] < 0 < config["log_std_max"] <= 3
-    ):
-        raise ValueError("log_std bounds must be finite: -10 <= min < 0 < max <= 3")
-    for key in ("guidance_enabled", "cvae_updates_crl"):
-        if type(config[key]) is not bool:
-            raise ValueError(f"{key} must be boolean")
+    for key in ("reconstruction_weight", "bc_weight", "latent_noise"):
+        finite_float(config[key], f"agent.{key}", strict=False)
 
 
 def load_config(path, overrides=()):
@@ -160,10 +157,11 @@ def load_config(path, overrides=()):
     config["data"]["directory"] = str(
         Path(config["data"]["directory"]).expanduser().resolve()
     )
-    if config["data"]["path"] is not None:
-        config["data"]["path"] = str(
-            Path(config["data"]["path"]).expanduser().resolve()
-        )
+    for section, key in (("data", "path"), ("init", "checkpoint")):
+        if config[section][key] is not None:
+            config[section][key] = str(
+                Path(config[section][key]).expanduser().resolve()
+            )
     return config
 
 
@@ -182,7 +180,7 @@ def validate_config(config):
     if not config["train"]["stages"]:
         raise ValueError("At least one training stage is required")
     for stage in config["train"]["stages"]:
-        if stage["name"] not in ("joint", "representation", "action"):
+        if stage["name"] not in ("representation", "actor", "joint"):
             raise ValueError(f"Unknown stage: {stage['name']}")
         positive_int(stage["steps"], "stage.steps")
     if sum(s["steps"] for s in config["train"]["stages"]) >= 2**31:
@@ -198,6 +196,20 @@ def validate_config(config):
         positive_int(task, "task_id")
     if len(set(tasks)) != len(tasks):
         raise ValueError("task_ids must be unique")
+    init = config["init"]
+    modules = init["modules"]
+    if (
+        not modules
+        or len(set(modules)) != len(modules)
+        or not set(modules) <= {"representation", "actor"}
+    ):
+        raise ValueError(
+            "init.modules must be a nonempty unique subset of [representation, actor]"
+        )
+    if init["checkpoint"] is not None and (
+        not isinstance(init["checkpoint"], str) or not init["checkpoint"].strip()
+    ):
+        raise ValueError("init.checkpoint must be null or a checkpoint path")
     if config["logging"]["backend"] not in ("console", "wandb"):
         raise ValueError("logging.backend must be console or wandb")
     for value in (

@@ -1,4 +1,4 @@
-"""Regression tests for RNG isolation and recovery from saturated student outputs."""
+"""Regression tests for RNG isolation, evaluation cadence and checkpoint format."""
 
 import ast
 import json
@@ -11,7 +11,7 @@ from pathlib import Path
 import jax
 import numpy as np
 from flax import nnx, serialization
-from test_baseline import FakeEnv, equal, seeded_agent, seeded_source
+from test_agent import FakeEnv, equal, seeded_agent, seeded_source
 
 from craft.agents.craft import CRAFTAgent
 from craft.config import load_config
@@ -103,7 +103,10 @@ class EngineTests(unittest.TestCase):
         self.assertGreater(int(train.jax.params.count[...]), 0)
         self.assertEqual(int(train.jax.updates.count[...]), 0)
         self.assertFalse(
-            equal(pure_state(agent)["posterior"], pure_state(agent)["prior"])
+            equal(
+                pure_state(agent)["representation"]["state_encoder"],
+                pure_state(agent)["representation"]["goal_encoder"],
+            )
         )
         fresh = seeded_agent(8, 6, 2, config)
         self.assertTrue(equal(pure_state(agent), pure_state(fresh)))
@@ -177,5 +180,5 @@ class EngineTests(unittest.TestCase):
                     {"format_version": 2, "agent": {}, "run_state": "{}"}
                 )
             )
-            with self.assertRaisesRegex(ValueError, "expected v5"):
+            with self.assertRaisesRegex(ValueError, "expected v6"):
                 read_checkpoint(path)

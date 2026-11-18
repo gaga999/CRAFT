@@ -77,8 +77,8 @@ class PrefetchBatches:
         return indices, deepcopy(self._rng.bit_generator.state)
 
     def _gather(self, indices):
-        # actor_goals is unused by CRAFT; its RNG draw is still in the plan.
-        return self.dataset.gather(indices, include_actor_goals=False)
+        # Actor goals (uniform future state) train the actor; value goals the critic.
+        return self.dataset.gather(indices)
 
     def _put(self, item):
         while not self._stop.is_set():

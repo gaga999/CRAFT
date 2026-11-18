@@ -1,4 +1,14 @@
-"""CRL + conditional VAE POC. Guidance updates only the stochastic prior."""
+"""CRAFT latent-actor agent.
+
+Gradient ownership:
+- representation optimizer: CRL (backbone, latent projection, state/goal encoders,
+  head, scale, bias) + reconstruction_weight * reconstruction (backbone, latent
+  projection, decoder). Reconstruction decodes normalize(z + latent_noise * eps)
+  so the decoder tolerates imperfect actor latents; CRL uses the clean z.
+- actor optimizer: normalized critic score of the actor latent + latent BC. The
+  score is differentiated THROUGH fixed representation weights.
+All gradients use pre-update parameters. Stages: representation | actor | joint.
+"""
 
 from functools import partial
 
@@ -7,49 +17,50 @@ import jax.numpy as jnp
 import optax
 from flax import nnx
 
+from craft.losses.actor import actor_loss
 from craft.losses.contrastive import contrastive_loss
-from craft.losses.cvae import gaussian_kl
-from craft.models.cvae import sample_gaussian
-from craft.models.factory import make_poc_models
-from craft.policies.chunk import sample_action_chunk
+from craft.losses.reconstruction import reconstruction_mse
+from craft.models.representation import (
+    LatentActor,
+    Representation,
+    normalize_latent,
+)
+from craft.policies.chunk import act
+
+STAGES = ("representation", "actor", "joint")
 
 
 def all_finite(tree):
     return jnp.all(jnp.stack([jnp.all(jnp.isfinite(x)) for x in jax.tree.leaves(tree)]))
 
 
+def optimizer(module, learning_rate, max_grad_norm):
+    return nnx.Optimizer(
+        module,
+        optax.chain(
+            optax.clip_by_global_norm(max_grad_norm), optax.adam(learning_rate)
+        ),
+        wrt=nnx.Param,
+    )
+
+
 class CRAFTAgent(nnx.Module):
     def __init__(self, observation_dim, action_dim, config, *, rngs, batch_size):
-        self.critic, self.posterior, self.decoder, self.prior = make_poc_models(
-            config, observation_dim, action_dim, rngs=rngs, batch_size=batch_size
+        self.representation = Representation(
+            observation_dim, action_dim, config, rngs=rngs, batch_size=batch_size
+        )
+        self.actor = LatentActor(observation_dim, config, rngs=rngs)
+        self.representation_optimizer = optimizer(
+            self.representation, config["learning_rate"], config["max_grad_norm"]
+        )
+        self.actor_optimizer = optimizer(
+            self.actor, config["actor_learning_rate"], config["max_grad_norm"]
         )
         self.observation_dim, self.action_dim = observation_dim, action_dim
-        self.chunk_length = config["chunk_length"]
-        self.kl_weight, self.guide_weight = config["kl_weight"], config["guide_weight"]
-        self.guidance_enabled, self.cvae_updates_crl = (
-            config["guidance_enabled"],
-            config["cvae_updates_crl"],
-        )
-        self.condition_drop_prob = config["condition_drop_prob"]
-        self.optimizers = nnx.List(
-            [
-                nnx.Optimizer(
-                    model,
-                    optax.chain(
-                        optax.clip_by_global_norm(config["max_grad_norm"]),
-                        optax.adam(
-                            config["prior_learning_rate"]
-                            if i == 3
-                            else config["learning_rate"]
-                        ),
-                    ),
-                    wrt=nnx.Param,
-                )
-                for i, model in enumerate(
-                    (self.critic, self.posterior, self.decoder, self.prior)
-                )
-            ]
-        )
+        self.reconstruction_weight = config["reconstruction_weight"]
+        self.bc_weight = config["bc_weight"]
+        self.latent_noise = config["latent_noise"]
+        # params: initialization; updates: decoder-input noise (checkpointed).
         self.rngs = rngs
         self.step = nnx.Variable(jnp.array(0, jnp.int32))
 
@@ -64,186 +75,237 @@ class CRAFTAgent(nnx.Module):
             )
         raise ValueError("Positive dimensions and batch_size >= 2 required")
 
-    def ae_objective(
-        self, critic, posterior, decoder, batch, key, mask, prior_parameters
-    ):
+    # Objectives -----------------------------------------------------------
+
+    def perturb(self, z, key):
+        """Noise on the latent support: re-apply the parameter-free LayerNorm."""
+        if self.latent_noise == 0:
+            return z
+        return normalize_latent(
+            z + self.latent_noise * jax.random.normal(key, z.shape, z.dtype)
+        )
+
+    def representation_objective(self, representation, batch, key):
         s, a, g = batch["observations"], batch["action_chunks"], batch["value_goals"]
-        tokens, hg, hs = critic.features(s, a), critic.encode(g), critic.encode(s)
-        if not self.cvae_updates_crl:
-            tokens, hg, hs = jax.tree.map(jax.lax.stop_gradient, (tokens, hg, hs))
-        q = posterior(tokens, hg)
-        reconstruction = decoder(sample_gaussian(q, key), hs, hg, mask)
-        rec = jnp.square(reconstruction - a).mean()
-        kl = gaussian_kl(q, prior_parameters)
-        return rec + self.kl_weight * kl, (rec, kl, q)
-
-    def prior_objective(self, prior, batch, q, key):
-        s, g = batch["observations"], batch["value_goals"]
-        hs, hg = jax.tree.map(
-            jax.lax.stop_gradient, (self.critic.encode(s), self.critic.encode(g))
+        z = representation.latent(s, a)
+        phi = representation.embed(z, representation.state_features(s))
+        crl, metrics = contrastive_loss(
+            phi,
+            representation.goal(g),
+            representation.log_scale[...],
+            representation.bias[...],
         )
-        p = prior(s, g, hs, hg)
-        kl = gaussian_kl(jax.tree.map(jax.lax.stop_gradient, q), p)
-        # No hard clip: decoder's differentiable tanh output is already bounded.
-        actions = self.decoder(
-            sample_gaussian(p, key), hs, hg, jnp.ones((s.shape[0], 1, 1))
-        )
-        guide = (
-            -self.critic.score(s, actions, g).mean()
-            if self.guidance_enabled
-            else jnp.array(0.0)
-        )
-        return self.kl_weight * kl + self.guide_weight * guide, (kl, guide)
-
-    @partial(nnx.jit, static_argnames=("stage",))
-    def update(self, batch, *, stage="joint"):
-        if stage not in ("joint", "representation", "action"):
-            raise ValueError(f"Unknown stage: {stage}")
-        s, a, g = batch["observations"], batch["action_chunks"], batch["value_goals"]
-        previous = self.rngs.updates.count[...]
-        qkey, pkey, mkey = jax.random.split(self.rngs.updates(), 3)
-
-        def crl(model):
-            return contrastive_loss(
-                *model(s, a, g), model.log_scale[...], model.bias[...]
-            )
-
-        (_, metrics), cg = nnx.value_and_grad(crl, has_aux=True)(self.critic)
-        hs, hg = jax.tree.map(
-            jax.lax.stop_gradient, (self.critic.encode(s), self.critic.encode(g))
-        )
-        pp = jax.tree.map(jax.lax.stop_gradient, self.prior(s, g, hs, hg))
-        mask = jax.random.bernoulli(
-            mkey, 1 - self.condition_drop_prob, (s.shape[0], 1, 1)
-        ).astype(s.dtype)
-
-        def ae(c, p, d):
-            return self.ae_objective(c, p, d, batch, qkey, mask, pp)
-
-        (_, (rec, kl, q)), (acg, pg, dg) = nnx.value_and_grad(
-            ae, argnums=(0, 1, 2), has_aux=True
-        )(self.critic, self.posterior, self.decoder)
-
-        def prior_terms(p):
-            _, (pkl, guide) = self.prior_objective(p, batch, q, pkey)
-            return jnp.stack([self.kl_weight * pkl, self.guide_weight * guide]), (
-                pkl,
-                guide,
-            )
-
-        terms, backward, (pkl, guide) = nnx.vjp(
-            prior_terms, self.prior, has_aux=True, graph_updates=False
-        )
-        kg = backward(jnp.array([1.0, 0.0]))[0]
-        gg = backward(jnp.array([0.0, 1.0]))[0]
-        rg = jax.tree.map(lambda x, y: x + y, kg, gg)
-        if stage == "joint":
-            cg = jax.tree.map(lambda x, y: x + y, cg, acg)
+        reconstruction = representation.decode(s, self.perturb(z, key))
+        rec = reconstruction_mse(reconstruction, a)
+        loss = crl + self.reconstruction_weight * rec
         metrics.update(
             {
-                "vae/reconstruction": rec,
-                "vae/kl": kl,
-                "prior/kl": pkl,
-                "prior/guidance": guide,
-                "prior/grad_norm": optax.tree.norm(rg),
-                "prior/weighted_kl": terms[0],
-                "prior/weighted_guidance": terms[1],
-                "prior/kl_grad_norm": optax.tree.norm(kg),
-                "prior/guide_grad_norm": optax.tree.norm(gg),
-                "prior/guide_to_kl_grad_ratio": optax.tree.norm(gg)
-                / (optax.tree.norm(kg) + 1e-8),
-                "decoder/condition_gate": self.decoder.gate,
-                "decoder/condition_keep": mask.mean(),
-                "vae/posterior_std": jnp.exp(q[1]).mean(),
-                "prior/std": jnp.exp(pp[1]).mean(),
+                "representation/loss": loss,
+                "rec/mse": rec,
+                "rec/mse_first": reconstruction_mse(reconstruction[:, 0], a[:, 0]),
+                "latent/batch_std": z.std(0).mean(),
             }
         )
-        gradients = (cg, pg, dg, rg)
-        finite = all_finite((gradients, metrics, batch))
+        return loss, (metrics, z)
 
-        def commit(agent):
-            for i, model in enumerate(
-                (agent.critic, agent.posterior, agent.decoder, agent.prior)
-            ):
-                if (stage != "action" or i != 0) and (
-                    stage != "representation" or i == 0
-                ):
-                    agent.optimizers[i].update(model, gradients[i])
-            agent.step[...] += 1
+    def actor_objective(self, actor, batch, z_data):
+        s, g = batch["observations"], batch["actor_goals"]
+        z_hat = actor(s, g)
+        score = self.representation.score(s, z_hat, g)
+        loss, (q_loss, bc) = actor_loss(score, z_hat, z_data, self.bc_weight)
+        data_score = jax.lax.stop_gradient(self.representation.score(s, z_data, g))
+        return loss, {
+            "actor/loss": loss,
+            "actor/q_loss": q_loss,
+            "actor/bc": bc,
+            "actor/score": score.mean(),
+            "actor/score_data": data_score.mean(),
+            "actor/score_gain": (score - data_score).mean(),
+        }
 
-        # Select instead of nnx.cond: a device conditional makes XLA copy the
-        # predicate to the host mid-step, serializing every update. Rejection
-        # restores parameters, optimizer state, step and the RNG count.
-        rejected = jax.tree.map(lambda x: x, nnx.state(self))
-        rejected_count = previous
-        commit(self)
-        committed = nnx.state(self)
-        nnx.update(
-            self,
-            jax.tree.map(
-                lambda new, old: jnp.where(finite, new, old), committed, rejected
-            ),
-        )
-        self.rngs.updates.count[...] = jnp.where(
-            finite, self.rngs.updates.count[...], rejected_count
-        )
-        return {**metrics, "numerics/finite": finite}
+    # Updates ----------------------------------------------------------------
 
-    def update_chunk(self, batches, *, stage="joint"):
-        """Run `update` over batches stacked on a leading axis in one dispatch.
+    def train_step(self, batch, stage):
+        """Trace-time update that mutates this (merged) agent; caller commits."""
+        if stage not in STAGES:
+            raise ValueError(f"Unknown stage: {stage}")
+        s, a = batch["observations"], batch["action_chunks"]
+        metrics, grads = {}, {}
+        if stage == "actor":
+            z = self.representation.latent(s, a)
+        else:
+            key = self.rngs.updates() if self.latent_noise > 0 else None
+            (_, (metrics, z)), grads["representation"] = nnx.value_and_grad(
+                lambda model: self.representation_objective(model, batch, key),
+                has_aux=True,
+            )(self.representation)
+            metrics["grad/representation_norm"] = optax.tree.norm(
+                grads["representation"]
+            )
+        if stage != "representation":
+            z_data = jax.lax.stop_gradient(z)
+            (_, actor_metrics), grads["actor"] = nnx.value_and_grad(
+                lambda model: self.actor_objective(model, batch, z_data),
+                has_aux=True,
+            )(self.actor)
+            metrics.update(actor_metrics)
+            metrics["grad/actor_norm"] = optax.tree.norm(grads["actor"])
+        finite = all_finite((grads, metrics, batch))
+        if "representation" in grads:
+            self.representation_optimizer.update(
+                self.representation, grads["representation"]
+            )
+        if "actor" in grads:
+            self.actor_optimizer.update(self.actor, grads["actor"])
+        self.step[...] += 1
+        return metrics, finite
 
-        Per-call host cost (NNX graph traversal plus XLA dispatch) exceeds this
-        model's device time, so scanning many updates per call keeps the GPU
-        busy. Updates are identical to calling `update` once per batch. Returns
-        last-step metrics; `numerics/finite` is true only if every step was
-        finite, otherwise no state from the chunk is committed.
-        """
+    def update(self, batch, *, stage="joint"):
+        """One update; state is committed only when every value is finite."""
+        if stage not in STAGES:
+            raise ValueError(f"Unknown stage: {stage}")
         graphdef, state = nnx.split(self)
-        state, metrics = _scan_updates(graphdef, state, batches, stage)
+        state, metrics = _step(graphdef, state, batch, stage)
         if bool(metrics["numerics/finite"]):
             nnx.update(self, state)
         return metrics
 
-    @nnx.jit
-    def sample_action_chunk(self, observations, goals, rng):
-        return sample_action_chunk(
-            self.critic, self.prior, self.decoder, observations, goals, rng
-        )
+    def update_chunk(self, batches, *, stage="joint"):
+        """`update` over batches stacked on a leading axis, in one dispatch.
+
+        Returns last-step metrics; a nonfinite step rejects the whole chunk.
+        """
+        if stage not in STAGES:
+            raise ValueError(f"Unknown stage: {stage}")
+        graphdef, state = nnx.split(self)
+        state, metrics = _scan(graphdef, state, batches, stage)
+        if bool(metrics["numerics/finite"]):
+            nnx.update(self, state)
+        return metrics
+
+    # Inference and diagnostics ---------------------------------------------
+
+    def policy(self):
+        """Snapshot of current weights as `(observations, goals, key) -> chunk`.
+
+        One `jax.jit` over explicit state avoids per-call NNX graph traversal
+        during rollouts. The policy is deterministic; `key` is accepted for
+        the evaluator interface. Create a new policy after further updates.
+        """
+        rep_graph, rep_state = nnx.split(self.representation)
+        actor_graph, actor_state = nnx.split(self.actor)
+
+        def policy(observations, goals, key=None):
+            return _act(
+                rep_graph, actor_graph, rep_state, actor_state, observations, goals
+            )
+
+        return policy
 
     @nnx.jit
     def validation_metrics(self, batch, key):
-        s, a, g = batch["observations"], batch["action_chunks"], batch["value_goals"]
+        rep, actor = self.representation, self.actor
+        s, a = batch["observations"], batch["action_chunks"]
+        g, actor_goals = batch["value_goals"], batch["actor_goals"]
+        z, es = rep.latent(s, a), rep.state_features(s)
+        phi = rep.embed(z, es)
         _, metrics = contrastive_loss(
-            *self.critic(s, a, g), self.critic.log_scale[...], self.critic.bias[...]
+            phi, rep.goal(g), rep.log_scale[...], rep.bias[...]
         )
-        qkey, pkey = jax.random.split(key)
-        hs, hg = self.critic.encode(s), self.critic.encode(g)
-        q = self.posterior(self.critic.features(s, a), hg)
-        p = self.prior(s, g, hs, hg)
-        z = sample_gaussian(q, qkey)
-        mask = jnp.ones((s.shape[0], 1, 1))
-        reconstructed = self.decoder(z, hs, hg, mask)
-        sampled = self.decoder(sample_gaussian(p, pkey), hs, hg, mask)
-        shuffled = self.decoder(jnp.roll(z, 1, axis=0), hs, hg, mask)
+        reconstruction = rep.decode(s, z)
+        roll = partial(jnp.roll, shift=1, axis=0)
+        # Interventional sensitivity: swap actions OR states between samples.
+        action_effect = jnp.linalg.norm(
+            phi - rep.embed(rep.latent(s, roll(a)), es), axis=-1
+        ).mean()
+        state_effect = jnp.linalg.norm(
+            phi - rep.embed(rep.latent(roll(s), a), rep.state_features(roll(s))),
+            axis=-1,
+        ).mean()
+        z_hat = actor(s, actor_goals)
+        actions_hat = rep.decode(s, z_hat)
+        z_cycle = rep.latent(s, actions_hat)
+        score = rep.score(s, z_hat, actor_goals)
+        score_cycle = rep.score(s, z_cycle, actor_goals)
+
+        def crl_term(model):
+            phi = model.embed(model.latent(s, a), model.state_features(s))
+            return contrastive_loss(
+                phi, model.goal(g), model.log_scale[...], model.bias[...]
+            )[0]
+
+        def rec_term(model):
+            prediction = model.decode(s, self.perturb(model.latent(s, a), key))
+            return self.reconstruction_weight * reconstruction_mse(prediction, a)
+
+        def shared_norm(grad):
+            return optax.tree.norm((grad["backbone"], grad["latent_projection"]))
+
+        def actor_terms(model):
+            z = model(s, actor_goals)
+            return actor_loss(rep.score(s, z, actor_goals), z, rep.latent(s, a), 1.0)[1]
+
+        q_grad = nnx.grad(lambda m: actor_terms(m)[0])(actor)
+        bc_grad = nnx.grad(lambda m: self.bc_weight * actor_terms(m)[1])(actor)
+        crl_grad = shared_norm(nnx.grad(crl_term)(rep))
+        rec_grad = shared_norm(nnx.grad(rec_term)(rep))
         metrics.update(
             {
-                "vae/reconstruction": jnp.square(reconstructed - a).mean(),
-                "vae/kl": gaussian_kl(q, p),
-                "vae/prior_sample_mse": jnp.square(sampled - a).mean(),
-                "vae/shuffled_latent_mse": jnp.square(shuffled - a).mean(),
+                "rec/mse": reconstruction_mse(reconstruction, a),
+                "rec/mse_first": reconstruction_mse(reconstruction[:, 0], a[:, 0]),
+                "rec/noisy_latent_mse": reconstruction_mse(
+                    rep.decode(s, self.perturb(z, key)), a
+                ),
+                "rec/shuffled_latent_mse": reconstruction_mse(
+                    rep.decode(s, roll(z)), a
+                ),
+                "latent/batch_std": z.std(0).mean(),
+                "latent/action_effect": action_effect,
+                "latent/state_effect": state_effect,
+                "latent/action_to_state_effect": action_effect / (state_effect + 1e-8),
+                "actor/score": score.mean(),
+                "actor/score_data": rep.score(s, z, actor_goals).mean(),
+                "actor/score_reencoded": score_cycle.mean(),
+                "actor/score_exploit_gap": (score - score_cycle).mean(),
+                "actor/latent_mse": reconstruction_mse(z_hat, z),
+                "actor/action_mse": reconstruction_mse(actions_hat, a),
+                "actor/cycle_mse": reconstruction_mse(z_cycle, z_hat),
+                "grad/crl_shared_norm": crl_grad,
+                "grad/rec_shared_norm": rec_grad,
+                "grad/crl_to_rec_ratio": crl_grad / (rec_grad + 1e-8),
+                "grad/q_to_bc_ratio": optax.tree.norm(q_grad)
+                / (optax.tree.norm(bc_grad) + 1e-8),
             }
         )
         return {f"validation/{k}": v for k, v in metrics.items()}
 
 
 @partial(jax.jit, static_argnames=("graphdef", "stage"))
-def _scan_updates(graphdef, state, batches, stage):
+def _step(graphdef, state, batch, stage):
+    agent = nnx.merge(graphdef, state)
+    metrics, finite = agent.train_step(batch, stage)
+    return nnx.state(agent), {**metrics, "numerics/finite": finite}
+
+
+@partial(jax.jit, static_argnames=("graphdef", "stage"))
+def _scan(graphdef, state, batches, stage):
+    # No per-step select: a nonfinite step rejects the whole chunk on the host,
+    # so later steps of a rejected chunk never reach committed state.
     def body(state, batch):
         agent = nnx.merge(graphdef, state)
-        metrics = agent.update(batch, stage=stage)
-        return nnx.state(agent), metrics
+        metrics, finite = agent.train_step(batch, stage)
+        return nnx.state(agent), (metrics, finite)
 
-    state, metrics = jax.lax.scan(body, state, batches)
-    finite = jnp.all(metrics.pop("numerics/finite"))
+    state, (metrics, finite) = jax.lax.scan(body, state, batches)
     last = jax.tree.map(lambda x: x[-1], metrics)
-    return state, {**last, "numerics/finite": finite}
+    return state, {**last, "numerics/finite": jnp.all(finite)}
+
+
+@partial(jax.jit, static_argnames=("rep_graph", "actor_graph"))
+def _act(rep_graph, actor_graph, rep_state, actor_state, observations, goals):
+    return act(
+        nnx.merge(rep_graph, rep_state),
+        nnx.merge(actor_graph, actor_state),
+        observations,
+        goals,
+    )

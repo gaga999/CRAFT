@@ -75,6 +75,7 @@ def allocate_session(
     destination=None,
     allow_code_change=False,
     checkpoint_sha256=None,
+    initialization=None,
 ):
     root = Path(config["output_dir"]).expanduser().resolve()
     token = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
@@ -117,6 +118,8 @@ def allocate_session(
             "path": str(Path(checkpoint).resolve()),
             "sha256": checkpoint_sha256 or file_hash(checkpoint),
         },
+        # Parameters copied into a NEW run (optimizers and step start fresh).
+        "initialization": initialization,
     }
     source_root = Path(__file__).resolve().parents[3]
     with zipfile.ZipFile(

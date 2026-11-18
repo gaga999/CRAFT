@@ -1,0 +1,45 @@
+# Easy sanity task: 2-D point navigation (action dim 2); should learn quickly.
+seed: 0
+output_dir: runs/pointmaze_medium
+agent:
+  chunk_length: 5
+  width: 128
+  depth: 4
+  exchange_every: 2
+  embedding_dim: 128
+  latent_dim: 4
+  decoder_depth: 2
+  actor_width: 256
+  actor_depth: 3
+  reconstruction_weight: 1.0
+  bc_weight: 10.0
+  latent_noise: 0.2
+  learning_rate: 0.0003
+  actor_learning_rate: 0.0003
+  max_grad_norm: 10.0
+data:
+  name: pointmaze-medium-navigate-v0
+  directory: data/ogbench
+  path: null
+  synthetic: false
+  batch_size: 256
+  discount: 0.99
+  workers: 2
+  prefetch_batches: 4
+  device_prefetch: 2
+train:
+  stages:
+    - name: joint
+      steps: 300000
+  log_interval: 1000
+  eval_interval: 25000
+  save_interval: 25000
+evaluation:
+  episodes: 5
+  execution_length: 1
+init:
+  checkpoint: null
+  modules: [representation, actor]
+logging:
+  backend: wandb
+  project: craft

@@ -1,25 +1,24 @@
+# Hard task: two-cube manipulation from play data (action dim 5).
 seed: 0
-output_dir: runs/crl_tokens
+output_dir: runs/cube_double_play
 agent:
   chunk_length: 5
   width: 128
   depth: 4
   exchange_every: 2
-  latent_dim: 128
-  vae_latent_dim: 16
-  fusion_depth: 2
-  prior_learning_rate: 0.0001
-  kl_weight: 0.01
-  guide_weight: 0.1
-  guidance_enabled: true
-  cvae_updates_crl: false
-  condition_drop_prob: 0.2
-  log_std_min: -4.0
-  log_std_max: 1.0
+  embedding_dim: 128
+  latent_dim: 8
+  decoder_depth: 2
+  actor_width: 256
+  actor_depth: 3
+  reconstruction_weight: 1.0
+  bc_weight: 10.0
+  latent_noise: 0.2
   learning_rate: 0.0003
+  actor_learning_rate: 0.0003
   max_grad_norm: 10.0
 data:
-  name: pointmaze-medium-navigate-v0
+  name: cube-double-play-v0
   directory: data/ogbench
   path: null
   synthetic: false
@@ -36,8 +35,11 @@ train:
   eval_interval: 50000
   save_interval: 50000
 evaluation:
-  episodes: 20
+  episodes: 10
   execution_length: 1
+init:
+  checkpoint: null
+  modules: [representation, actor]
 logging:
-  backend: console
+  backend: wandb
   project: craft

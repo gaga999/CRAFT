@@ -10,7 +10,7 @@ import jax
 import numpy as np
 from flax import nnx, serialization
 
-FORMAT_VERSION = 5
+FORMAT_VERSION = 6
 
 
 def _is_key(value):
@@ -56,7 +56,7 @@ def read_checkpoint(path):
     payload = serialization.msgpack_restore(raw)
     if not isinstance(payload, dict) or payload.get("format_version") != FORMAT_VERSION:
         raise ValueError(
-            "Unsupported checkpoint format; expected v5 CVAE POC with convolutional token mixing and log gate. Start a new run for older checkpoints."
+            "Unsupported checkpoint format; expected v6 latent-actor agent (representation, actor and their optimizers). Start a new run for older checkpoints."
         )
     if not isinstance(payload.get("agent"), dict) or not isinstance(
         payload.get("run_state"), str
@@ -67,34 +67,54 @@ def read_checkpoint(path):
     return payload
 
 
-def restore_checkpoint(path, *, agent, payload=None):
-    if payload is None:
-        payload = read_checkpoint(path)
-    metadata = json.loads(payload["run_state"])
-    if not isinstance(metadata, dict):
-        raise TypeError("Checkpoint run metadata must be a JSON object")
-    require_finite(payload["agent"])
-    expected, got = (
-        jax.tree.flatten_with_path(pure_state(agent))[0],
-        jax.tree.flatten_with_path(payload["agent"])[0],
-    )
+def _matching_arrays(template, values, what):
+    expected = jax.tree.flatten_with_path(template)[0]
+    got = jax.tree.flatten_with_path(values)[0]
     if len(expected) != len(got) or any(
         p != q
         or np.shape(a) != np.shape(b)
         or np.asarray(a).dtype != np.asarray(b).dtype
         for (p, a), (q, b) in zip(expected, got)
     ):
-        raise ValueError(
-            "Checkpoint state paths, shapes, or dtypes do not match this NNX agent"
+        raise ValueError(f"Checkpoint {what} paths, shapes, or dtypes do not match")
+
+
+def _restore_array(expected, value):
+    if _is_key(expected):
+        return jax.random.wrap_key_data(
+            jax.numpy.asarray(value), impl=jax.random.key_impl(expected)
         )
+    return jax.numpy.asarray(value)
+
+
+def restore_checkpoint(path, *, agent, payload=None):
+    """Restore the COMPLETE agent state (models, optimizers, RNG, step)."""
+    if payload is None:
+        payload = read_checkpoint(path)
+    metadata = json.loads(payload["run_state"])
+    if not isinstance(metadata, dict):
+        raise TypeError("Checkpoint run metadata must be a JSON object")
+    require_finite(payload["agent"])
+    _matching_arrays(pure_state(agent), payload["agent"], "agent state")
     template = nnx.to_pure_dict(nnx.state(agent))
-
-    def restore_array(expected, value):
-        if _is_key(expected):
-            return jax.random.wrap_key_data(
-                jax.numpy.asarray(value), impl=jax.random.key_impl(expected)
-            )
-        return jax.numpy.asarray(value)
-
-    nnx.update(agent, jax.tree.map(restore_array, template, payload["agent"]))
+    nnx.update(agent, jax.tree.map(_restore_array, template, payload["agent"]))
     return metadata
+
+
+def load_modules(payload, *, agent, modules):
+    """Copy only the parameters of named agent modules (no optimizer/step/RNG).
+
+    Every module is validated before any is written, so failure leaves the
+    agent unchanged.
+    """
+    source = payload["agent"]
+    for name in modules:
+        if name not in source:
+            raise ValueError(f"Checkpoint has no module {name!r}")
+        _matching_arrays(
+            pure_state(getattr(agent, name)), source[name], f"module {name!r}"
+        )
+    for name in modules:
+        module = getattr(agent, name)
+        template = nnx.to_pure_dict(nnx.state(module))
+        nnx.update(module, jax.tree.map(_restore_array, template, source[name]))

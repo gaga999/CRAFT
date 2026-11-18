@@ -10,7 +10,7 @@ from unittest.mock import patch
 import numpy as np
 from flax import nnx
 from omegaconf.errors import OmegaConfBaseException
-from test_baseline import (
+from test_agent import (
     FakeEnv,
     assert_equivalent_training,
     equal,
@@ -31,18 +31,40 @@ def snapshot(path):
 
 
 class ConfigTests(unittest.TestCase):
-    def test_all_shipped_configs_and_coefficient(self):
-        for path in Path("configs/experiment").glob("*.yaml"):
+    def test_all_shipped_configs_load_with_defaults_where_unset(self):
+        paths = sorted(Path("configs/experiment").glob("*.yaml"))
+        self.assertEqual(
+            [p.stem for p in paths],
+            [
+                "cube_double_play",
+                "cube_single_noisy",
+                "pointmaze_medium",
+                "puzzle_3x3_noisy",
+                "smoke",
+            ],
+        )
+        for path in paths:
             config = load_config(path)
-            self.assertEqual(config["agent"]["guide_weight"], 0.1)
-            self.assertEqual(config["data"]["discount"], 0.95)
+            self.assertEqual([s["name"] for s in config["train"]["stages"]], ["joint"])
+            self.assertIsNone(config["init"]["checkpoint"])
+            self.assertEqual(config["agent"]["bc_weight"], 10.0)
+            self.assertEqual(config["agent"]["latent_noise"], 0.2)
 
     def test_invalid_configs_fail_before_any_run(self):
         for override in [
             "agent.alpha=10",
+            "agent.kl_weight=0.1",
+            "agent.latent_dim=2",
+            "agent.bc_weight=-1",
+            "agent.latent_noise=-0.1",
+            "agent.latent_noise=nan",
+            "train.stages=[{name: action, steps: 1}]",
+            "init.modules=[]",
+            "init.modules=[decoder]",
+            "init.modules=[actor,actor]",
             "agent.width=1.5",
             "agent.width=true",
-            "agent.kl_weight=nan",
+            "agent.reconstruction_weight=nan",
             "agent.learning_rate=inf",
             "agent.width=0",
             "data.discount=1",
@@ -96,6 +118,45 @@ class RuntimeTests(unittest.TestCase):
             ]
             self.assertEqual([row["step"] for row in rows], [2, 3])
 
+    def test_init_from_checkpoint_starts_a_new_run_with_fresh_optimizers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = run_experiment(self.config(directory), max_steps=2)
+            before = snapshot(source)
+            c = self.config(directory)
+            c["output_dir"] = str(Path(directory) / "child")
+            c["init"]["checkpoint"] = str(source / "checkpoint.msgpack")
+            c["init"]["modules"] = ["representation"]
+            c["train"]["stages"] = [{"name": "actor", "steps": 1}]
+            child = run_experiment(c)
+            self.assertEqual(before, snapshot(source))
+            meta = json.loads((child / "metadata.json").read_text())
+            self.assertEqual(meta["initialization"]["modules"], ["representation"])
+            self.assertEqual(meta["initialization"]["source_step"], 2)
+            parent, loaded = (
+                seeded_agent(0, 6, 2, c["agent"]),
+                seeded_agent(0, 6, 2, c["agent"]),
+            )
+            restore_checkpoint(source / "checkpoint.msgpack", agent=parent)
+            restore_checkpoint(child / "checkpoint.msgpack", agent=loaded)
+            # Actor-only training kept the loaded representation exactly.
+            self.assertTrue(
+                equal(
+                    pure_state(parent)["representation"],
+                    pure_state(loaded)["representation"],
+                )
+            )
+            self.assertEqual(int(loaded.step[...]), 1)
+            # A different dataset is rejected before any output is written.
+            changed = seeded_source()[0].data
+            changed["actions"][0] += 0.1
+            c["output_dir"] = str(Path(directory) / "rejected")
+            with (
+                patch("craft.experiments.synthetic_dataset", return_value=changed),
+                self.assertRaisesRegex(ValueError, "different dataset"),
+            ):
+                run_experiment(c)
+            self.assertEqual(list(Path(directory).glob("rejected*")), [])
+
     def test_eval_source_immutable_and_no_dataset_load(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(directory)
@@ -146,7 +207,7 @@ class RuntimeTests(unittest.TestCase):
             c = load_config(run / "config.yaml")
             before = snapshot(run)
             invalid = deepcopy(c)
-            invalid["agent"]["guide_weight"] = 10
+            invalid["agent"]["bc_weight"] = 3.0
             with self.assertRaisesRegex(ValueError, "mismatch"):
                 run_experiment(invalid, checkpoint=run / "checkpoint.msgpack")
             changed = seeded_source()[0].data
@@ -164,7 +225,8 @@ class RuntimeTests(unittest.TestCase):
         config = load_config("configs/experiment/smoke.yaml")["agent"]
         stages = [
             {"name": "representation", "steps": 3},
-            {"name": "joint", "steps": 7},
+            {"name": "actor", "steps": 2},
+            {"name": "joint", "steps": 5},
         ]
         results = {}
         for steps_per_call in (1, 4):
@@ -197,7 +259,8 @@ class RuntimeTests(unittest.TestCase):
             [
                 (2, "representation"),
                 (3, "representation"),
-                (4, "joint"),
+                (4, "actor"),
+                (5, "actor"),
                 (8, "joint"),
                 (10, "joint"),
             ],

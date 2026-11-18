@@ -165,9 +165,7 @@ class PrefetchTests(unittest.TestCase):
                         self.assertTrue(
                             all(isinstance(x, jax.Array) for x in actual.values())
                         )
-                        assert_batches(
-                            self, actual, reference.sample(8, include_actor_goals=False)
-                        )
+                        assert_batches(self, actual, reference.sample(8))
                         batches.accept()
                         before = deepcopy(reference.rng.bit_generator.state)
                         self.assertEqual(ds.rng.bit_generator.state, before)
@@ -188,7 +186,7 @@ class PrefetchTests(unittest.TestCase):
                         assert_batches(
                             self,
                             {k: v[i] for k, v in chunk.items()},
-                            reference.sample(8, include_actor_goals=False),
+                            reference.sample(8),
                         )
                     batches.accept()
                     self.assertEqual(
@@ -213,7 +211,7 @@ class PrefetchTests(unittest.TestCase):
         with PrefetchBatches(ds, 8, 1, workers=1) as resumed:
             batch = next(resumed)
             assert_batches(self, batch, unaccepted)
-            assert_batches(self, batch, reference.sample(8, include_actor_goals=False))
+            assert_batches(self, batch, reference.sample(8))
             resumed.accept()
         self.assertEqual(ds.rng.bit_generator.state, reference.rng.bit_generator.state)
 
@@ -288,7 +286,7 @@ class SchedulingTests(unittest.TestCase):
         ds, reference, agent = source(), source(), FakeAgent()
         stages = [
             {"name": "representation", "steps": 2},
-            {"name": "action", "steps": 3},
+            {"name": "actor", "steps": 3},
         ]
         observed = []
         train_offline(
@@ -301,10 +299,10 @@ class SchedulingTests(unittest.TestCase):
         )
         train_offline(agent, ds, stages, batch_size=8, workers=1)
         self.assertEqual(
-            [s for s, _ in agent.calls], ["representation"] * 2 + ["action"] * 3
+            [s for s, _ in agent.calls], ["representation"] * 2 + ["actor"] * 3
         )
         for _, batch in agent.calls:
-            assert_batches(self, batch, reference.sample(8, include_actor_goals=False))
+            assert_batches(self, batch, reference.sample(8))
         self.assertEqual(ds.rng.bit_generator.state, reference.rng.bit_generator.state)
         self.assertEqual([s for s, _ in observed], [1, 2, 3])
         self.assertTrue(all(m["time/data_wait_seconds"] >= 0 for _, m in observed))

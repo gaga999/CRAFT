@@ -10,7 +10,12 @@ from craft.data.offline import OfflineDataset, synthetic_dataset
 from craft.envs.factory import make_env, make_env_and_datasets
 from craft.evaluators.rollout import evaluate_rollouts
 from craft.trainers.offline import train_offline
-from craft.utils.checkpoint import read_checkpoint, restore_checkpoint, save_checkpoint
+from craft.utils.checkpoint import (
+    load_modules,
+    read_checkpoint,
+    restore_checkpoint,
+    save_checkpoint,
+)
 from craft.utils.logging import Logger
 from craft.utils.random import make_random_engines
 from craft.utils.runs import allocate_session, provenance, write_json
@@ -98,11 +103,10 @@ def run_experiment(
     training_engine, evaluation_engine = make_random_engines(config["seed"])
     env = logger = session = agent = data = val = None
     identity = None
+    initial = None
+    if saved is None and not evaluate and config["init"]["checkpoint"] is not None:
+        initial = read_checkpoint(config["init"]["checkpoint"])
     try:
-        if saved is None:
-            config = dict(config)
-            session = allocate_session(config, mode="train")
-            config["output_dir"] = str(session)
         if evaluate:
             env = make_env(config["data"]["name"])
             observation_dim, action_dim = saved["dimensions"]
@@ -150,7 +154,33 @@ def run_experiment(
             rngs=training_engine.jax,
             batch_size=config["data"]["batch_size"],
         )
-        if saved is not None:
+        if initial is not None:
+            source = json.loads(initial["run_state"])
+            if source.get("dimensions") != [observation_dim, action_dim] or (
+                source.get("dataset_identity") != identity
+            ):
+                raise ValueError(
+                    "init.checkpoint was trained on a different dataset or dimensions"
+                )
+            load_modules(initial, agent=agent, modules=config["init"]["modules"])
+        if saved is None:
+            # Fresh sessions are allocated only after data, model and
+            # initialization checks pass, so failed setup writes nothing.
+            config = dict(config)
+            session = allocate_session(
+                config,
+                mode="train",
+                initialization=None
+                if initial is None
+                else {
+                    "path": config["init"]["checkpoint"],
+                    "sha256": initial["checkpoint_sha256"],
+                    "modules": config["init"]["modules"],
+                    "source_step": source["step"],
+                },
+            )
+            config["output_dir"] = str(session)
+        else:
             restored = restore_checkpoint(checkpoint, agent=agent, payload=payload)
             if restored != saved or int(agent.step[...]) != saved["step"]:
                 raise ValueError("Checkpoint metadata and agent step disagree")
@@ -172,7 +202,7 @@ def run_experiment(
 
         def evaluation_metrics():
             return evaluate_rollouts(
-                agent.sample_action_chunk,
+                agent.policy(),
                 env,
                 engine=evaluation_engine,
                 **config["evaluation"],
@@ -202,9 +232,7 @@ def run_experiment(
             if log_due and val is not None:
                 metrics.update(
                     agent.validation_metrics(
-                        val.sample(
-                            config["data"]["batch_size"], include_actor_goals=False
-                        ),
+                        val.sample(config["data"]["batch_size"]),
                         evaluation_engine.task_key(0),
                     )
                 )

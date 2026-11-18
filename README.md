@@ -1,82 +1,129 @@
-# CRAFT CVAE POC
+# CRAFT latent-actor POC
 
 **Contrastive Representation for Action Flow and Temporal Abstraction**
 
-A Flax NNX proof of concept combining CRL representations with a conditional VAE
-and a stochastic latent prior. Standard vector-state, continuous-action OGBench
-is supported. This is an experimental method, not a validated learning result.
+A Flax NNX proof of concept that generates action chunks in a CRL-shaped
+latent space. The CRL state-action encoder produces a per-action latent that
+both feeds the contrastive head and decodes back to the chunk; an actor
+generates that latent and is guided by the critic score. Standard vector-state,
+continuous-action OGBench is supported. This is an experimental method, not a
+validated learning result.
 
 ## Run
 
 ```bash
 uv sync --locked
 # Each invocation appends a UTC timestamp and UUID to output_dir automatically.
-JAX_PLATFORMS=cpu uv run craft --config configs/experiment/cube_single_noisy.yaml
-# Short check using the same model; printed output names are unique.
-uv run craft --config configs/experiment/smoke.yaml
+CUDA_VISIBLE_DEVICES=0 uv run craft --config configs/experiment/puzzle_3x3_noisy.yaml
+uv run craft --config configs/experiment/smoke.yaml   # plumbing check
 uv run python -m unittest discover -s tests -v
 uv run ruff check .
 ```
 
 `--steps N` limits additional updates without changing the saved schedule.
 `--dry-run` validates/prints settings. OGBench downloads data on first use.
-Enable tracking with `logging.backend=wandb` (`WANDB_MODE=offline` for local runs).
-For NVIDIA Linux, install `uv sync --locked --extra cuda` and keep `--extra cuda`
-on `uv run`; select a device using `CUDA_VISIBLE_DEVICES=0 JAX_PLATFORMS=cuda`.
-See [JAX device requirements](https://docs.jax.dev/en/latest/installation.html).
+Shipped real-task configs log to W&B (`WANDB_MODE=offline` for local runs,
+`logging.backend=console` to disable).
 
-Datasets stay in shared host RAM in OGBench's compact storage layout. Train and
-validation splits load concurrently; next observations are gathered only for
-sampled goals. By default, `data.workers=2` NumPy worker threads prepare up to
-`data.prefetch_batches=4` CPU batches, with `data.device_prefetch=2` queued batches
-transferred asynchronously via JAX `device_put`. Threads avoid dataset replication
-and process serialization. Set `data.workers=0` for synchronous batch preparation
-(used by the smoke config). These are bounded buffers, not a full-dataset GPU preload.
+### GPU (NVIDIA Linux)
 
-Each `nnx.jit` call costs ~10–35 ms of host time (NNX graph traversal of ~450
-variables plus XLA dispatch), more than this model's device time per update.
-Training therefore runs `agent.update_chunk`: one `lax.scan` over up to
-gcd(log, eval, save intervals) ≤ 100 consecutive updates per dispatch. Updates
-and callback steps are unchanged; a nonfinite update rejects its whole chunk.
-`time/data_wait_seconds` (consumer wait for prefetched batches) and
-`time/update_seconds` (update including its finite-result barrier) are per-step
-averages over the chunk. Any unfinished asynchronous transfer is included in
-update time.
-Compilation, evaluation, logging, and checkpoint writes can also affect GPU
-utilization. Performance depends on the host and accelerator; prefetch is not a
-claim that data loading is the current bottleneck.
+```bash
+uv sync --locked --extra cuda
+CUDA_VISIBLE_DEVICES=0 JAX_PLATFORMS=cuda \
+  uv run --extra cuda craft --config configs/experiment/cube_single_noisy.yaml
+```
+
+`CUDA_VISIBLE_DEVICES` selects the GPU (one run uses one device). JAX
+preallocates 75% of GPU memory at startup; to share a GPU between runs, prefix
+one of these [memory options](https://docs.jax.dev/en/latest/gpu_memory_allocation.html):
+
+| Variable | Effect |
+| --- | --- |
+| `XLA_PYTHON_CLIENT_MEM_FRACTION=.25` | preallocate this fraction instead of `.75` |
+| `XLA_PYTHON_CLIENT_PREALLOCATE=false` | no preallocation; grow on demand (may fragment) |
+| `XLA_PYTHON_CLIENT_ALLOCATOR=platform` | allocate/free exactly as needed; slow, for debugging |
+
+```bash
+CUDA_VISIBLE_DEVICES=1 JAX_PLATFORMS=cuda XLA_PYTHON_CLIENT_MEM_FRACTION=.25 \
+  uv run --extra cuda craft --config configs/experiment/puzzle_3x3_noisy.yaml
+```
+
+| Config | Dataset | Role | Steps |
+| --- | --- | --- | --- |
+| `smoke.yaml` | synthetic | plumbing only | 3 |
+| `pointmaze_medium.yaml` | `pointmaze-medium-navigate-v0` | easy sanity task | 300k |
+| `cube_single_noisy.yaml` | `cube-single-noisy-v0` | main task | 1M |
+| `puzzle_3x3_noisy.yaml` | `puzzle-3x3-noisy-v0` | puzzle task | 1M |
+| `cube_double_play.yaml` | `cube-double-play-v0` | hard task | 1M |
+
+Settings and their evidence are in [method details](docs/method.md).
 
 ## Architecture
 
 ```text
-(s, ground-truth A) -> phi Mixer tokens -> mean pool -> projection -> normalized phi
-                  |                                          | BxB sigmoid loss
-                  |       g -> independent psi MLP -> normalized psi
-                  + cat psi goal feature -> posterior Mixer -> Gaussian Zq per action
-s,g + detached psi(s),psi(g) -> prior MLP -> Gaussian Zp per action
-Zq or Zp + position + gated state/goal condition -> decoder Mixer -> tanh actions
+(s, a_1..a_H) -> token Mixer -> action tokens -> Linear -> LayerNorm -> z [H, Z]
+s -> state encoder -> e_s;   phi = unit(MLP([flatten(z); e_s]));   psi = unit(MLP(g))
+CRL: SigLIP  exp(t) * phi.psi + b    reconstruction: decoder(s, LN(z + sigma*eps)) -> A
+actor: (s, g) -> MLP -> LayerNorm -> z_hat -> decoder(s, z_hat) -> executed chunk
+actor loss: -score(s, z_hat, g) / sg(mean|score|) + bc_weight * |z_hat - sg(z)|^2
 ```
 
-Chunk length is 5. Posterior fuses 6 phi tokens and one psi goal token, then reads
-5 action positions. Decoder has 5 latent tokens; conditions have separate state/goal
-projections, a learned positive scalar gate, and per-sample branch dropout
-(default 0.2). Inference/guidance keep the condition on. Shared FFNs exchange information every
-2 layers. Prior/decoder share no weights with critic; they use actual detached critic
-features. There is no FQL teacher or student.
+`score` is `exp(t) * phi(z_hat, e_s(s)) . psi(g)` with the true state, so the
+actor can change only the action latent. Representation weights (CRL +
+`reconstruction_weight` x reconstruction) and actor weights (actor loss) have
+separate optimizers; the actor differentiates through fixed representation
+weights. See [contracts](docs/interfaces.md).
 
-Losses: sigmoid CRL with learned positive scale and signed bias; posterior
-reconstruction plus Gaussian KL; prior KL plus SigLIP-logit critic guidance
-(enabled by default). Guidance
-updates only prior weights, differentiating THROUGH fixed decoder/critic weights.
-No hard action clip is used in training or guidance; tanh bounds decoder outputs.
-CVAE-to-CRL gradients are optional (`agent.cvae_updates_crl`, default false).
-See [method details](docs/baseline.md) and [contracts](docs/interfaces.md).
+## Stages and initialization
+
+`train.stages` is a list of `representation` (encoder, heads, decoder),
+`actor` (actor only, representation fixed) and `joint` (both, each with its own
+objective from pre-update parameters). Shipped configs use one `joint` stage.
+
+`init.checkpoint` starts a NEW run from another run's parameters:
+
+```bash
+uv run craft --config configs/experiment/cube_single_noisy.yaml \
+  init.checkpoint=runs/<source-run>/checkpoint.msgpack "init.modules=[representation]" \
+  "train.stages=[{name: actor, steps: 300000}]"
+```
+
+Only the listed modules' parameters are copied; optimizers, step and the data
+sampler start fresh. The source must come from the same dataset and dimensions,
+and its path, SHA-256, modules and step are recorded in `metadata.json`.
+
+## Metrics
+
+| Prefix | Meaning |
+| --- | --- |
+| `crl/` | loss, scale `t`, bias `b`, top-1 and binary accuracy, mean positive/negative logits |
+| `rec/` | chunk and first-action MSE (training: noisy decoder input); validation: clean, noisy and batch-shuffled latents |
+| `latent/` | per-dimension batch std; validation: `phi` change when actions vs states are swapped, and their ratio |
+| `actor/` | q/BC terms, actor and dataset-latent scores and their gain; validation: latent/action MSE to data, re-encoded score, `score_exploit_gap` (direct minus re-encoded score), cycle MSE |
+| `grad/` | pre-clip norms; validation: CRL vs reconstruction on shared encoder, q vs BC on actor |
+| `evaluation/` | per-task and overall success |
+
+`validation/*` is computed on the official validation split at each log step.
+
+## Throughput
+
+Each NNX transform call costs milliseconds of host-side graph traversal, which
+can exceed this model's device time. Training therefore scans up to
+gcd(log, eval, save intervals) ≤ 100 updates per dispatch as a pure function
+of the split state; a nonfinite step rejects the whole chunk on the host, so
+no per-step state copy is kept. Evaluation snapshots the policy once into a
+`jax.jit` of explicit state. `time/data_wait_seconds` and
+`time/update_seconds` are per-step averages over the chunk.
+
+Datasets stay in host RAM in OGBench's compact layout; `data.workers` threads
+prepare up to `data.prefetch_batches` CPU batches and `data.device_prefetch`
+device batches. Set `data.workers=0` for synchronous preparation.
 
 ## Outputs and resume
 
-`output_dir` is a **prefix**, e.g. `runs/cube_single_noisy-<UTC>-<UUID>`. The resolved
-path is printed and saved in config/checkpoint. Reusing the prefix creates a new
-run without mixing metrics. Use the actual printed directory to resume:
+`output_dir` is a **prefix**, e.g. `runs/cube_single_noisy-<UTC>-<UUID>`. The
+resolved path is printed and saved in config/checkpoint. Use the printed
+directory to resume or evaluate:
 
 ```bash
 RUN_DIR="runs/your-printed-run-directory"
@@ -85,23 +132,16 @@ uv run python scripts/evaluate.py --config "$RUN_DIR/config.yaml" \
   --restore "$RUN_DIR/checkpoint.msgpack" evaluation.episodes=20
 ```
 
-Resume creates a new session under the original run; evaluation writes outside it.
-Original metadata/metrics remain immutable. Checkpoint **v5** stores all NNX model,
-optimizer, RNG, sampler and schedule state; older checkpoints are rejected.
-Code changes on resume require explicit `--allow-code-change`. Sessions archive
-resolved config, code/dependencies, environment metadata, dataset hashes and JSONL
-metrics. Ctrl-C saves the latest accepted update; hard termination relies on the
-last periodic save.
-
-The three data prefetch settings may change on resume: worker scheduling does not
-change sample order or committed sampler state. Lookahead batches are discarded
-and regenerated from that state; dataset fingerprints describe logical transitions
-and match the former regular-array layout.
+Resume creates a new session under the original run; evaluation writes outside
+it. Original metadata/metrics remain immutable. Checkpoint **v6** stores both
+models, both optimizers, RNG, sampler and schedule state; older checkpoints are
+rejected. Code changes on resume require `--allow-code-change`. Data prefetch
+settings may change on resume. Ctrl-C saves the latest accepted update.
 
 | Directory/file (under `src/craft/`) | Responsibility |
 | --- | --- |
-| `models/tokens.py`, `models/cvae.py` | Critic, shared token FFNs, posterior, prior and decoder |
-| `agents/craft.py`, `losses/` | Gradient ownership, staged optimizers, CRL and CVAE losses |
+| `models/tokens.py`, `models/representation.py` | Token Mixer, representation, decoder, actor |
+| `agents/craft.py`, `losses/` | Gradient ownership, stages, optimizers, diagnostics |
 | `policies/`, `evaluators/` | Inference composition and task rollouts |
-| `config.py`, `experiments.py`, `cli.py` | Strict settings, assembly and entry points |
-| `data/`, `envs/`, `trainers/`, `utils/` | Sampling, OGBench, scheduling, isolated RNG/session/checkpoint services |
+| `config.py`, `experiments.py`, `cli.py` | Strict settings, assembly, initialization, entry points |
+| `data/`, `envs/`, `trainers/`, `utils/` | Sampling, OGBench, scheduling, RNG/session/checkpoint services |
