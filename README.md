@@ -99,16 +99,27 @@ and its path, SHA-256, modules and step are recorded in `metadata.json`.
 
 ## Metrics
 
-| Prefix | Meaning |
-| --- | --- |
-| `crl/` | loss, effective (capped) scale `t`, bias `b`, top-1 and binary accuracy, mean positive/negative logits; training reads noisy latents, validation clean ones |
-| `rec/` | chunk and first-action MSE (training: noisy decoder input); validation: clean, noisy and batch-shuffled latents |
-| `latent/` | per-dimension batch std; validation: `phi` change when actions vs states are swapped, and their ratio |
-| `actor/` | q/BC terms, guided score vs dataset score; validation: `score_direct`, `score_reencoded`, `score_data`, `score_gain` (re-encoded minus data: real improvement), `score_exploit_gap` (direct minus re-encoded), latent/action/cycle MSE |
-| `grad/` | pre-clip norms; validation: CRL vs reconstruction on shared encoder, q vs BC on actor |
-| `evaluation/` | per-task and overall success |
+Each metric answers one question; read them together before tuning.
 
-`validation/*` is computed on the official validation split at each log step.
+| Metric | Question | Problem when |
+| --- | --- | --- |
+| `crl/loss` vs `validation/crl/loss` | Does the critic generalize? | the gap widens: overfitting |
+| `crl/scale` | Is the temperature at `max_scale`? | pinned at the cap for long |
+| `validation/crl/auc_<k>` | Does the critic still pick the true state `k` steps ahead over other samples' goals (0.5 = chance)? | near 0.5 at the distances tasks need: horizon too short |
+| `validation/latent/action_to_state_effect` | How much does `phi` move when actions vs states are swapped? | near 0: critic ignores actions |
+| `rec/mse`, `validation/rec/mse` | Does the decoder reconstruct chunks? | high |
+| `validation/rec/shuffled_latent_mse` | Does the decoder use `z`? | close to `rec/mse` |
+| `actor/q_loss`, `actor/bc` | Actor loss terms | |
+| `actor/score_gain` | Does the executed chunk beat the dataset chunk under the critic? | <= 0: guidance gives nothing |
+| `validation/actor/score_exploit_gap` | Is the actor's latent scored above the chunk it executes? | large: latent exploitation |
+| `validation/actor/action_mse` | How far are actor actions from data actions? | above the dataset action variance: out of distribution |
+| `validation/grad/crl_to_rec_ratio`, `validation/grad/q_to_bc_ratio` | Gradient balance of each optimizer's objectives | one term dominates |
+| `grad/representation_norm`, `grad/actor_norm` | Pre-clip gradient norms | spikes or clipping |
+| `evaluation/*/success` | Task success | |
+
+Training metrics use the training batch (noisy latents); `validation/*` uses the
+official validation split with clean latents at each log step. `auc_<k>` uses
+5, 20, 50, 100 and 200 steps; distances longer than every episode are skipped.
 
 ## Throughput
 

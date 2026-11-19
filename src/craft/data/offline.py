@@ -107,6 +107,23 @@ class OfflineDataset:
         actor_offset = rng.integers(1, remaining + 1)
         return i, i + value_offset - 1, i + actor_offset - 1
 
+    def sample_at_offset(self, batch_size, offset, *, rng=None):
+        """Chunks whose value goal is the state exactly `offset` steps later.
+
+        Returns None when no anchor has `offset` steps left in its episode.
+        Used for horizon-resolved critic diagnostics, not for training.
+        """
+        if type(offset) is not int or offset < 1:
+            raise ValueError("offset must be a positive integer")
+        rng = self.rng if rng is None else rng
+        remaining = self.episode_ends[np.searchsorted(self.episode_ends, self.valid)]
+        anchors = self.valid[remaining - self.valid + 1 >= offset]
+        if not len(anchors):
+            return None
+        i = rng.choice(anchors, batch_size)
+        goals = i + offset - 1
+        return self.gather((i, goals, goals), include_actor_goals=False)
+
     def gather(self, indices, *, include_actor_goals=True):
         i, value_indices, actor_indices = indices
         future = (

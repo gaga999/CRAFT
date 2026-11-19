@@ -30,9 +30,8 @@ the decoder average neighbouring chunks (it learns `E[A | noisy z]`) and pulls
 actor latents back toward data, weakening guidance. A decoder trained WITHOUT
 noise (same 4k-step checkpoint) is sharply sensitive: validation MSE 0.0097 clean,
 0.048 / 0.149 / 0.371 at sigma 0.1 / 0.2 / 0.4, 0.85 with shuffled latents.
-Training with noise is not yet measured;
-watch `rec/noisy_latent_mse` against `rec/mse`, `rec/shuffled_latent_mse`,
-`actor/score_gain` and success. `0` disables it.
+Trained with noise (1M-step cube run), validation MSE was 0.0104 clean and 0.0165
+at sigma 0.2. `0` disables it.
 
 ## Evidence from the first 1M-step runs
 
@@ -109,9 +108,25 @@ tasks. Success under these settings is not yet measured.
 - Deterministic actor: in multimodal data it regresses to the mean latent. That
   this mean decodes to useful actions is the hypothesis under test, not a given.
 
+## Critic horizon (puzzle)
+
+With the current settings `cube-single-noisy-v0` reached 0.94 success and
+`puzzle-3x3-noisy-v0` about 0.2 (1M steps, one seed). Puzzle is lights-out: a
+press toggles a button and its neighbours. The data presses about every 21
+steps, and the evaluation tasks need 2 / 5 / 8 / 9 / 7 presses (tasks 1-5);
+only task 1 (2 presses) succeeds reliably. Pairwise AUC of the final critic
+against goals exactly k steps ahead:
+
+| k (steps) | 5 | 20 | 50 | 100 | 200 |
+| --- | --- | --- | --- | --- | --- |
+| puzzle | 1.00 | 1.00 | 0.89 | 0.68 | 0.58 |
+| cube | 1.00 | 0.99 | 0.97 | 0.88 | 0.75 |
+
+With `discount = 0.95` (mean goal offset about 20 steps) the critic is near
+chance at the 100-190 steps the failing tasks need, so guidance cannot help
+there. `validation/crl/auc_<k>` tracks this during training.
+
 ## Diagnostics to read before conclusions
 
-Success alone is insufficient. Check `validation/rec/shuffled_latent_mse` (decoder
-uses `z`), `latent/action_to_state_effect` (critic uses actions),
-`actor/score_gain` (executed chunk beats data), `actor/score_exploit_gap` and
-`actor/cycle_mse` (actor stays on the encoder's image), `grad/*_ratio` (objective balance), multiple seeds and compute.
+Success alone is insufficient. The [README metrics table](../README.md#metrics)
+lists what each logged metric diagnoses; also compare multiple seeds and compute.

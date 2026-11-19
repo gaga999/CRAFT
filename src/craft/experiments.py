@@ -32,6 +32,16 @@ def checkpoint_metadata(agent, config, training_engine, identity, environment):
     }
 
 
+# Goal distances (steps) for validation/crl/auc_<k>; offsets longer than every
+# episode are skipped.
+CRITIC_HORIZONS = (5, 20, 50, 100, 200)
+
+
+def horizon_batches(dataset, batch_size):
+    batches = {k: dataset.sample_at_offset(batch_size, k) for k in CRITIC_HORIZONS}
+    return {k: b for k, b in batches.items() if b is not None}
+
+
 def check_restore(config, saved, *, evaluate):
     fields = (
         ("seed", "agent", "data", "train", "output_dir") if evaluate else tuple(config)
@@ -234,6 +244,7 @@ def run_experiment(
                     agent.validation_metrics(
                         val.sample(config["data"]["batch_size"]),
                         evaluation_engine.task_key(0),
+                        horizon_batches(val, config["data"]["batch_size"]),
                     )
                 )
             if eval_due:

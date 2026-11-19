@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
-from craft.agents.craft import CRAFTAgent
+from craft.agents.craft import CRAFTAgent, pairwise_auc
 from craft.config import load_config
 from craft.data.offline import OfflineDataset, synthetic_dataset
 from craft.losses.actor import actor_loss
@@ -44,8 +44,8 @@ def assert_equivalent_training(test, expected, actual, steps, config, batch):
     """
     test.assertEqual(int(expected.step[...]), int(actual.step[...]))
     key = jax.random.key(0)
-    want = expected.validation_metrics(batch, key)
-    got = actual.validation_metrics(batch, key)
+    want = expected.validation_metrics(batch, key, {})
+    got = actual.validation_metrics(batch, key, {})
     for name in want:
         np.testing.assert_allclose(got[name], want[name], rtol=1e-4, atol=1e-5)
     gaps = sorted(
@@ -194,8 +194,17 @@ class AgentTests(unittest.TestCase):
         np.testing.assert_allclose(
             loss, -jax.nn.log_sigmoid(labels * logits).sum(-1).mean(), rtol=1e-6
         )
-        off = (logits * (1 - jnp.eye(4))).sum() / 12
-        np.testing.assert_allclose(metrics["crl/logit_negative"], off, rtol=1e-5)
+        np.testing.assert_allclose(metrics["crl/scale"], 3.0, rtol=1e-6)
+        # AUC: fraction of off-diagonal pairs the true goal outscores.
+        wins = sum(
+            float(logits[i, i] > logits[i, j])
+            for i in range(4)
+            for j in range(4)
+            if i != j
+        )
+        np.testing.assert_allclose(pairwise_auc(logits), wins / 12)
+        np.testing.assert_allclose(pairwise_auc(jnp.eye(4)), 1.0)
+        np.testing.assert_allclose(pairwise_auc(-jnp.eye(4)), 0.0)
 
     def test_component_gradients_reach_only_their_owners(self):
         rep = self.a.representation
@@ -364,21 +373,47 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(equal(pure_state(self.a), pure_state(other)))
         before = pure_state(self.a)
         key = make_random_engines(1)[1].task_key(0)
-        first = self.a.validation_metrics(self.b, key)
-        second = self.a.validation_metrics(self.b, key)
+        source = seeded_source()[0]
+        horizons = {
+            5: source.sample_at_offset(4, 5),
+            20: source.sample_at_offset(4, 20),
+        }
+        first = self.a.validation_metrics(self.b, key, horizons)
+        second = self.a.validation_metrics(self.b, key, horizons)
         self.assertTrue(equal(first, second))
         self.assertTrue(equal(before, pure_state(self.a)))
         self.assertTrue(all(np.isfinite(v) for v in first.values()))
-        for name in (
-            "rec/shuffled_latent_mse",
-            "rec/noisy_latent_mse",
-            "latent/action_to_state_effect",
-            "actor/score_exploit_gap",
-            "actor/score_gain",
-            "grad/crl_to_rec_ratio",
-            "grad/q_to_bc_ratio",
-        ):
-            self.assertIn(f"validation/{name}", first)
+        self.assertEqual(
+            set(first),
+            {
+                f"validation/{name}"
+                for name in (
+                    "crl/loss",
+                    "crl/auc_5",
+                    "crl/auc_20",
+                    "latent/action_to_state_effect",
+                    "rec/mse",
+                    "rec/shuffled_latent_mse",
+                    "actor/score_gain",
+                    "actor/score_exploit_gap",
+                    "actor/action_mse",
+                    "grad/crl_to_rec_ratio",
+                    "grad/q_to_bc_ratio",
+                )
+            },
+        )
+
+    def test_offset_sampler_returns_exact_future_states_or_none(self):
+        source = seeded_source()[0]
+        before = source.rng.bit_generator.state
+        batch = source.sample_at_offset(8, 20, rng=np.random.default_rng(0))
+        self.assertEqual(before, source.rng.bit_generator.state)
+        obs, nxt = source.data["observations"], source.data["next_observations"]
+        for s, goal in zip(batch["observations"], batch["value_goals"]):
+            i = int(np.flatnonzero((obs == s).all(1))[0])
+            np.testing.assert_array_equal(goal, nxt[i + 19])
+            self.assertEqual(i // 32, (i + 19) // 32)  # same synthetic episode
+        self.assertIsNone(source.sample_at_offset(8, 33))
 
     def test_nonfinite_updates_are_rejected_atomically(self):
         before = pure_state(self.a)

@@ -120,14 +120,7 @@ class CRAFTAgent(nnx.Module):
         reconstruction = representation.decode(s, noisy)
         rec = reconstruction_mse(reconstruction, a)
         loss = crl + self.reconstruction_weight * rec
-        metrics.update(
-            {
-                "representation/loss": loss,
-                "rec/mse": rec,
-                "rec/mse_first": reconstruction_mse(reconstruction[:, 0], a[:, 0]),
-                "latent/batch_std": z.std(0).mean(),
-            }
-        )
+        metrics["rec/mse"] = rec
         return loss, (metrics, z)
 
     def guided_score(self, representation, states, z, goals):
@@ -143,11 +136,9 @@ class CRAFTAgent(nnx.Module):
         loss, (q_loss, bc) = actor_loss(score, z_hat, z_data, self.bc_weight)
         data_score = jax.lax.stop_gradient(self.representation.score(s, z_data, g))
         return loss, {
-            "actor/loss": loss,
             "actor/q_loss": q_loss,
             "actor/bc": bc,
-            "actor/score": score.mean(),
-            "actor/score_data": data_score.mean(),
+            # Guided score minus dataset score (re-encoded guidance: real gain).
             "actor/score_gain": (score - data_score).mean(),
         }
 
@@ -231,16 +222,25 @@ class CRAFTAgent(nnx.Module):
         return policy
 
     @nnx.jit
-    def validation_metrics(self, batch, key):
+    def validation_metrics(self, batch, key, horizon_batches):
+        """Diagnostics on the validation split, one question per metric.
+
+        crl/loss (vs training: overfitting), crl/auc_<k> (critic still tells
+        the true state k steps ahead from other goals: effective horizon),
+        latent/action_to_state_effect (critic uses actions), rec/mse and
+        rec/shuffled_latent_mse (decoder reconstructs and uses z),
+        actor/score_gain (executed chunk beats data), actor/score_exploit_gap
+        (latent scored above its executed chunk), actor/action_mse (distance
+        from data actions), grad/*_ratio (objective balance).
+        """
         rep, actor = self.representation, self.actor
         s, a = batch["observations"], batch["action_chunks"]
         g, actor_goals = batch["value_goals"], batch["actor_goals"]
         z, es = rep.latent(s, a), rep.state_features(s)
         phi = rep.embed(z, es)
-        _, metrics = contrastive_loss(
+        crl, _ = contrastive_loss(
             phi, rep.goal(g), rep.log_temperature(), rep.bias[...]
         )
-        reconstruction = rep.decode(s, z)
         roll = partial(jnp.roll, shift=1, axis=0)
         # Interventional sensitivity: swap actions OR states between samples.
         action_effect = jnp.linalg.norm(
@@ -252,9 +252,8 @@ class CRAFTAgent(nnx.Module):
         ).mean()
         z_hat = actor(s, actor_goals)
         actions_hat = rep.decode(s, z_hat)
-        z_cycle = rep.latent(s, actions_hat)
-        score = rep.score(s, z_hat, actor_goals)
-        score_cycle = rep.score(s, z_cycle, actor_goals)
+        score_direct = rep.score(s, z_hat, actor_goals)
+        score_executed = rep.score(s, rep.latent(s, actions_hat), actor_goals)
         score_data = rep.score(s, z, actor_goals)
 
         # Gradient balance of the TRAINING objective (same noisy latent).
@@ -273,45 +272,41 @@ class CRAFTAgent(nnx.Module):
             return optax.tree.norm((grad["backbone"], grad["latent_projection"]))
 
         def actor_terms(model):
-            z = model(s, actor_goals)
-            score = self.guided_score(rep, s, z, actor_goals)
-            return actor_loss(score, z, rep.latent(s, a), 1.0)[1]
+            generated = model(s, actor_goals)
+            score = self.guided_score(rep, s, generated, actor_goals)
+            return actor_loss(score, generated, z, 1.0)[1]
 
         q_grad = nnx.grad(lambda m: actor_terms(m)[0])(actor)
         bc_grad = nnx.grad(lambda m: self.bc_weight * actor_terms(m)[1])(actor)
         crl_grad = shared_norm(nnx.grad(crl_term)(rep))
         rec_grad = shared_norm(nnx.grad(rec_term)(rep))
-        metrics.update(
-            {
-                "rec/mse": reconstruction_mse(reconstruction, a),
-                "rec/mse_first": reconstruction_mse(reconstruction[:, 0], a[:, 0]),
-                "rec/noisy_latent_mse": reconstruction_mse(
-                    rep.decode(s, self.perturb(z, key)), a
-                ),
-                "rec/shuffled_latent_mse": reconstruction_mse(
-                    rep.decode(s, roll(z)), a
-                ),
-                "latent/batch_std": z.std(0).mean(),
-                "latent/action_effect": action_effect,
-                "latent/state_effect": state_effect,
-                "latent/action_to_state_effect": action_effect / (state_effect + 1e-8),
-                "actor/score_direct": score.mean(),
-                "actor/score_reencoded": score_cycle.mean(),
-                "actor/score_data": score_data.mean(),
-                # Real improvement: executed chunk vs dataset chunk.
-                "actor/score_gain": (score_cycle - score_data).mean(),
-                "actor/score_exploit_gap": (score - score_cycle).mean(),
-                "actor/latent_mse": reconstruction_mse(z_hat, z),
-                "actor/action_mse": reconstruction_mse(actions_hat, a),
-                "actor/cycle_mse": reconstruction_mse(z_cycle, z_hat),
-                "grad/crl_shared_norm": crl_grad,
-                "grad/rec_shared_norm": rec_grad,
-                "grad/crl_to_rec_ratio": crl_grad / (rec_grad + 1e-8),
-                "grad/q_to_bc_ratio": optax.tree.norm(q_grad)
-                / (optax.tree.norm(bc_grad) + 1e-8),
-            }
-        )
+        metrics = {
+            "crl/loss": crl,
+            "latent/action_to_state_effect": action_effect / (state_effect + 1e-8),
+            "rec/mse": reconstruction_mse(rep.decode(s, z), a),
+            "rec/shuffled_latent_mse": reconstruction_mse(rep.decode(s, roll(z)), a),
+            "actor/score_gain": (score_executed - score_data).mean(),
+            "actor/score_exploit_gap": (score_direct - score_executed).mean(),
+            "actor/action_mse": reconstruction_mse(actions_hat, a),
+            "grad/crl_to_rec_ratio": crl_grad / (rec_grad + 1e-8),
+            "grad/q_to_bc_ratio": optax.tree.norm(q_grad)
+            / (optax.tree.norm(bc_grad) + 1e-8),
+        }
+        for offset, horizon in horizon_batches.items():
+            logits = rep.logits(
+                rep.phi(horizon["observations"], horizon["action_chunks"]),
+                rep.goal(horizon["value_goals"]),
+                pairwise=True,
+            )
+            metrics[f"crl/auc_{offset}"] = pairwise_auc(logits)
         return {f"validation/{k}": v for k, v in metrics.items()}
+
+
+def pairwise_auc(logits):
+    """P(true goal outscores another sample's goal) over all off-diagonal pairs."""
+    n = logits.shape[0]
+    wins = (jnp.diag(logits)[:, None] > logits) & ~jnp.eye(n, dtype=bool)
+    return wins.sum() / (n * (n - 1))
 
 
 @partial(jax.jit, static_argnames=("graphdef", "stage"))
