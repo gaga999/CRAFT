@@ -19,10 +19,14 @@ class AgentConfig:
     actor_width: int = 256
     actor_depth: int = 3
     reconstruction_weight: float = 1.0
-    bc_weight: float = 10.0
+    bc_weight: float = 1.0
     latent_noise: float = 0.2
+    guidance: str = "reencoded"
+    max_scale: float = 30.0
     learning_rate: float = 0.0003
     actor_learning_rate: float = 0.0003
+    weight_decay: float = 0.01
+    actor_weight_decay: float = 0.0
     max_grad_norm: float = 10.0
 
 
@@ -121,8 +125,17 @@ def validate_agent(config):
     positive_int(config["latent_dim"], "agent.latent_dim", 3)
     for key in ("learning_rate", "actor_learning_rate", "max_grad_norm"):
         finite_float(config[key], f"agent.{key}")
-    for key in ("reconstruction_weight", "bc_weight", "latent_noise"):
+    for key in (
+        "reconstruction_weight",
+        "bc_weight",
+        "latent_noise",
+        "weight_decay",
+        "actor_weight_decay",
+    ):
         finite_float(config[key], f"agent.{key}", strict=False)
+    finite_float(config["max_scale"], "agent.max_scale", 1)
+    if config["guidance"] not in ("reencoded", "latent"):
+        raise ValueError("agent.guidance must be reencoded or latent")
 
 
 def load_config(path, overrides=()):

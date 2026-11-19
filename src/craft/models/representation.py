@@ -2,8 +2,10 @@
 
 (s, A) -> token backbone -> per-action latent z [B,H,Z] (parameter-free LayerNorm)
 s -> state encoder e_s;  phi = unit(head([flatten(z); e_s]));  psi = unit(psi(g))
-SigLIP logit = exp(log_scale) * phi.psi + bias;  decoder(s, z) -> A.
+SigLIP logit = t * phi.psi + bias, t = min(exp(log_scale), max_scale);  decoder(s, z) -> A.
 """
+
+import math
 
 import jax.numpy as jnp
 from flax import nnx
@@ -72,6 +74,8 @@ class Representation(nnx.Module):
         self.goal_encoder = MLP(observation_dim, (w, w), d, layer_norm=True, rngs=rngs)
         self.decoder = ChunkDecoder(observation_dim, action_dim, config, rngs=rngs)
         self.log_scale = nnx.Param(jnp.log(jnp.array(10.0, jnp.float32)))
+        # Upper bound on the temperature; above it log_scale gets no gradient.
+        self.max_log_scale = math.log(config["max_scale"])
         # Optimal binary-NCE logit offset for 1 positive : B-1 negatives.
         self.bias = nnx.Param(-jnp.log(jnp.array(batch_size - 1.0, jnp.float32)))
 
@@ -92,9 +96,12 @@ class Representation(nnx.Module):
     def phi(self, states, actions):
         return self.embed(self.latent(states, actions), self.state_features(states))
 
+    def log_temperature(self):
+        return jnp.minimum(self.log_scale[...], self.max_log_scale)
+
     def logits(self, phi, psi, *, pairwise=False):
         return siglip_logits(
-            phi, psi, self.log_scale[...], self.bias[...], pairwise=pairwise
+            phi, psi, self.log_temperature(), self.bias[...], pairwise=pairwise
         )
 
     def score(self, states, z, goals):
@@ -104,7 +111,7 @@ class Representation(nnx.Module):
         normalization reflects similarity, not the batch-size offset.
         """
         phi = self.embed(z, self.state_features(states))
-        return jnp.exp(self.log_scale[...]) * jnp.sum(phi * self.goal(goals), -1)
+        return jnp.exp(self.log_temperature()) * jnp.sum(phi * self.goal(goals), -1)
 
     def decode(self, states, z):
         return self.decoder(states, z)

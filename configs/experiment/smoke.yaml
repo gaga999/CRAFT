@@ -12,10 +12,14 @@ agent:
   actor_width: 32
   actor_depth: 2
   reconstruction_weight: 1.0
-  bc_weight: 10.0
+  bc_weight: 1.0
   latent_noise: 0.2
+  guidance: reencoded
+  max_scale: 30.0
   learning_rate: 0.0003
   actor_learning_rate: 0.0003
+  weight_decay: 0.01
+  actor_weight_decay: 0.0
   max_grad_norm: 10.0
 data:
   synthetic: true
@@ -25,9 +29,14 @@ data:
   prefetch_batches: 4
   device_prefetch: 2
 train:
+  # Every stage once: representation pretraining, actor-only, then joint.
   stages:
+    - name: representation
+      steps: 1
+    - name: actor
+      steps: 1
     - name: joint
-      steps: 3
+      steps: 1
   log_interval: 1
   eval_interval: 100
   save_interval: 3

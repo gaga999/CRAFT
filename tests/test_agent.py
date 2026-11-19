@@ -292,17 +292,70 @@ class AgentTests(unittest.TestCase):
         bad = {**self.b, "observations": np.full_like(self.b["observations"], np.nan)}
         agent.update(bad)
         self.assertEqual(int(agent.rngs.updates.count[...]), 0)
-        # CRL uses the clean latent: noise changes only the reconstruction term.
+        # Head and decoder read the same noisy latent: noise changes both terms,
+        # and a fixed key reproduces both exactly.
         quiet = nnx.clone(self.initial)
         quiet.latent_noise = 0.0
-        noisy_metrics = nnx.clone(self.initial).update(self.b, stage="representation")
-        quiet_metrics = quiet.update(self.b, stage="representation")
-        self.assertEqual(
-            float(noisy_metrics["crl/loss"]), float(quiet_metrics["crl/loss"])
+        rep = self.initial.representation
+        noisy_terms = self.initial.representation_objective(rep, self.b, key)[1][0]
+        again = self.initial.representation_objective(rep, self.b, key)[1][0]
+        quiet_terms = quiet.representation_objective(rep, self.b, key)[1][0]
+        for name in ("crl/loss", "rec/mse"):
+            self.assertNotEqual(float(noisy_terms[name]), float(quiet_terms[name]))
+            self.assertEqual(float(noisy_terms[name]), float(again[name]))
+
+    def test_weight_decay_shrinks_only_kernels_and_scale_is_capped(self):
+        rep = self.a.representation
+        before = pure_state(rep)
+        zero = jax.tree.map(jnp.zeros_like, nnx.state(rep, nnx.Param))
+        self.a.representation_optimizer.update(rep, zero)
+        after = pure_state(rep)
+        changed = {
+            jax.tree_util.keystr(p): not np.array_equal(x, y)
+            for (p, x), (_, y) in zip(
+                jax.tree.flatten_with_path(before)[0],
+                jax.tree.flatten_with_path(after)[0],
+            )
+        }
+        self.assertTrue(any(changed.values()))
+        for path, moved in changed.items():
+            self.assertEqual(moved, path.endswith("['kernel']"), path)
+        s, a, g, _ = self.inputs()
+        z = rep.latent(s, a)
+        rep.log_scale[...] = jnp.log(jnp.array(1000.0))
+        capped = rep.score(s, z, g)
+        rep.log_scale[...] = jnp.log(jnp.array(self.c["max_scale"]))
+        np.testing.assert_allclose(capped, rep.score(s, z, g), rtol=1e-6)
+        grad = nnx.grad(
+            lambda m: m.logits(m.phi(s, a), m.goal(g), pairwise=True).sum()
+        )(rep)
+        self.assertNotEqual(float(grad["log_scale"][...]), 0)
+        rep.log_scale[...] = jnp.log(jnp.array(1000.0))
+        grad = nnx.grad(
+            lambda m: m.logits(m.phi(s, a), m.goal(g), pairwise=True).sum()
+        )(rep)
+        self.assertEqual(float(grad["log_scale"][...]), 0)
+
+    def test_reencoded_guidance_scores_the_executed_chunk(self):
+        rep = self.a.representation
+        s, _, _, goals = self.inputs()
+        z_hat = self.a.actor(s, goals)
+        executed = rep.latent(s, rep.decode(s, z_hat))
+        np.testing.assert_allclose(
+            self.a.guided_score(rep, s, z_hat, goals),
+            rep.score(s, executed, goals),
+            rtol=1e-6,
         )
-        self.assertNotEqual(
-            float(noisy_metrics["rec/mse"]), float(quiet_metrics["rec/mse"])
-        )
+        before = pure_state(rep)
+        grads = {}
+        for mode in ("reencoded", "latent"):
+            self.a.guidance = mode
+            grads[mode] = nnx.grad(
+                lambda m: self.a.guided_score(rep, s, m(s, goals), goals).mean()
+            )(self.a.actor)
+            self.assertGreater(norm(grads[mode]), 0)
+        self.assertFalse(equal(grads["reencoded"], grads["latent"]))
+        self.assertTrue(equal(before, pure_state(rep)))
 
     def test_updates_are_reproducible_and_validation_read_only(self):
         other = nnx.clone(self.a)
@@ -321,6 +374,7 @@ class AgentTests(unittest.TestCase):
             "rec/noisy_latent_mse",
             "latent/action_to_state_effect",
             "actor/score_exploit_gap",
+            "actor/score_gain",
             "grad/crl_to_rec_ratio",
             "grad/q_to_bc_ratio",
         ):

@@ -1,12 +1,15 @@
 """CRAFT latent-actor agent.
 
 Gradient ownership:
-- representation optimizer: CRL (backbone, latent projection, state/goal encoders,
-  head, scale, bias) + reconstruction_weight * reconstruction (backbone, latent
-  projection, decoder). Reconstruction decodes normalize(z + latent_noise * eps)
-  so the decoder tolerates imperfect actor latents; CRL uses the clean z.
-- actor optimizer: normalized critic score of the actor latent + latent BC. The
-  score is differentiated THROUGH fixed representation weights.
+- representation optimizer (AdamW, kernels decayed): CRL (backbone, latent
+  projection, state/goal encoders, head, scale, bias) + reconstruction_weight *
+  reconstruction (backbone, latent projection, decoder). The head and the
+  decoder read the SAME noisy latent normalize(z + latent_noise * eps), so both
+  stay smooth near the encoder's image where actor latents land.
+- actor optimizer: normalized critic score + latent BC. With guidance
+  "reencoded" the score is that of the executed chunk, E(s, D(s, z_hat)), so
+  latents the critic head extrapolates on earn no credit. The score is
+  differentiated THROUGH fixed representation weights.
 All gradients use pre-update parameters. Stages: representation | actor | joint.
 """
 
@@ -34,11 +37,22 @@ def all_finite(tree):
     return jnp.all(jnp.stack([jnp.all(jnp.isfinite(x)) for x in jax.tree.leaves(tree)]))
 
 
-def optimizer(module, learning_rate, max_grad_norm):
+def kernel_mask(params):
+    """Decay weight matrices only: not biases, norms, positions, scale or bias."""
+
+    def is_kernel(path, _):
+        names = [k.key for k in path if isinstance(k, jax.tree_util.DictKey)]
+        return bool(names) and names[-1] == "kernel"
+
+    return jax.tree_util.tree_map_with_path(is_kernel, params)
+
+
+def optimizer(module, learning_rate, weight_decay, max_grad_norm):
     return nnx.Optimizer(
         module,
         optax.chain(
-            optax.clip_by_global_norm(max_grad_norm), optax.adam(learning_rate)
+            optax.clip_by_global_norm(max_grad_norm),
+            optax.adamw(learning_rate, weight_decay=weight_decay, mask=kernel_mask),
         ),
         wrt=nnx.Param,
     )
@@ -51,15 +65,22 @@ class CRAFTAgent(nnx.Module):
         )
         self.actor = LatentActor(observation_dim, config, rngs=rngs)
         self.representation_optimizer = optimizer(
-            self.representation, config["learning_rate"], config["max_grad_norm"]
+            self.representation,
+            config["learning_rate"],
+            config["weight_decay"],
+            config["max_grad_norm"],
         )
         self.actor_optimizer = optimizer(
-            self.actor, config["actor_learning_rate"], config["max_grad_norm"]
+            self.actor,
+            config["actor_learning_rate"],
+            config["actor_weight_decay"],
+            config["max_grad_norm"],
         )
         self.observation_dim, self.action_dim = observation_dim, action_dim
         self.reconstruction_weight = config["reconstruction_weight"]
         self.bc_weight = config["bc_weight"]
         self.latent_noise = config["latent_noise"]
+        self.guidance = config["guidance"]
         # params: initialization; updates: decoder-input noise (checkpointed).
         self.rngs = rngs
         self.step = nnx.Variable(jnp.array(0, jnp.int32))
@@ -88,14 +109,15 @@ class CRAFTAgent(nnx.Module):
     def representation_objective(self, representation, batch, key):
         s, a, g = batch["observations"], batch["action_chunks"], batch["value_goals"]
         z = representation.latent(s, a)
-        phi = representation.embed(z, representation.state_features(s))
+        noisy = self.perturb(z, key)  # one sample shared by head and decoder
+        phi = representation.embed(noisy, representation.state_features(s))
         crl, metrics = contrastive_loss(
             phi,
             representation.goal(g),
-            representation.log_scale[...],
+            representation.log_temperature(),
             representation.bias[...],
         )
-        reconstruction = representation.decode(s, self.perturb(z, key))
+        reconstruction = representation.decode(s, noisy)
         rec = reconstruction_mse(reconstruction, a)
         loss = crl + self.reconstruction_weight * rec
         metrics.update(
@@ -108,10 +130,16 @@ class CRAFTAgent(nnx.Module):
         )
         return loss, (metrics, z)
 
+    def guided_score(self, representation, states, z, goals):
+        if self.guidance == "reencoded":
+            actions = representation.decode(states, z)
+            z = representation.latent(states, actions)
+        return representation.score(states, z, goals)
+
     def actor_objective(self, actor, batch, z_data):
         s, g = batch["observations"], batch["actor_goals"]
         z_hat = actor(s, g)
-        score = self.representation.score(s, z_hat, g)
+        score = self.guided_score(self.representation, s, z_hat, g)
         loss, (q_loss, bc) = actor_loss(score, z_hat, z_data, self.bc_weight)
         data_score = jax.lax.stop_gradient(self.representation.score(s, z_data, g))
         return loss, {
@@ -210,7 +238,7 @@ class CRAFTAgent(nnx.Module):
         z, es = rep.latent(s, a), rep.state_features(s)
         phi = rep.embed(z, es)
         _, metrics = contrastive_loss(
-            phi, rep.goal(g), rep.log_scale[...], rep.bias[...]
+            phi, rep.goal(g), rep.log_temperature(), rep.bias[...]
         )
         reconstruction = rep.decode(s, z)
         roll = partial(jnp.roll, shift=1, axis=0)
@@ -227,11 +255,14 @@ class CRAFTAgent(nnx.Module):
         z_cycle = rep.latent(s, actions_hat)
         score = rep.score(s, z_hat, actor_goals)
         score_cycle = rep.score(s, z_cycle, actor_goals)
+        score_data = rep.score(s, z, actor_goals)
 
+        # Gradient balance of the TRAINING objective (same noisy latent).
         def crl_term(model):
-            phi = model.embed(model.latent(s, a), model.state_features(s))
+            noisy = self.perturb(model.latent(s, a), key)
+            phi = model.embed(noisy, model.state_features(s))
             return contrastive_loss(
-                phi, model.goal(g), model.log_scale[...], model.bias[...]
+                phi, model.goal(g), model.log_temperature(), model.bias[...]
             )[0]
 
         def rec_term(model):
@@ -243,7 +274,8 @@ class CRAFTAgent(nnx.Module):
 
         def actor_terms(model):
             z = model(s, actor_goals)
-            return actor_loss(rep.score(s, z, actor_goals), z, rep.latent(s, a), 1.0)[1]
+            score = self.guided_score(rep, s, z, actor_goals)
+            return actor_loss(score, z, rep.latent(s, a), 1.0)[1]
 
         q_grad = nnx.grad(lambda m: actor_terms(m)[0])(actor)
         bc_grad = nnx.grad(lambda m: self.bc_weight * actor_terms(m)[1])(actor)
@@ -263,9 +295,11 @@ class CRAFTAgent(nnx.Module):
                 "latent/action_effect": action_effect,
                 "latent/state_effect": state_effect,
                 "latent/action_to_state_effect": action_effect / (state_effect + 1e-8),
-                "actor/score": score.mean(),
-                "actor/score_data": rep.score(s, z, actor_goals).mean(),
+                "actor/score_direct": score.mean(),
                 "actor/score_reencoded": score_cycle.mean(),
+                "actor/score_data": score_data.mean(),
+                # Real improvement: executed chunk vs dataset chunk.
+                "actor/score_gain": (score_cycle - score_data).mean(),
                 "actor/score_exploit_gap": (score - score_cycle).mean(),
                 "actor/latent_mse": reconstruction_mse(z_hat, z),
                 "actor/action_mse": reconstruction_mse(actions_hat, a),

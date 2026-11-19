@@ -63,22 +63,27 @@ Settings and their evidence are in [method details](docs/method.md).
 ```text
 (s, a_1..a_H) -> token Mixer -> action tokens -> Linear -> LayerNorm -> z [H, Z]
 s -> state encoder -> e_s;   phi = unit(MLP([flatten(z); e_s]));   psi = unit(MLP(g))
-CRL: SigLIP  exp(t) * phi.psi + b    reconstruction: decoder(s, LN(z + sigma*eps)) -> A
-actor: (s, g) -> MLP -> LayerNorm -> z_hat -> decoder(s, z_hat) -> executed chunk
-actor loss: -score(s, z_hat, g) / sg(mean|score|) + bc_weight * |z_hat - sg(z)|^2
+z~ = LN(z + sigma*eps)   (one sample, read by BOTH the head and the decoder)
+CRL: SigLIP  t * phi(z~).psi + b,  t <= max_scale     reconstruction: decoder(s, z~) -> A
+actor: (s, g) -> MLP -> LayerNorm -> z_hat -> decoder(s, z_hat) -> executed chunk A_hat
+actor loss: -score(s, E(s, A_hat), g) / sg(mean|score|) + bc_weight * |z_hat - sg(z)|^2
 ```
 
-`score` is `exp(t) * phi(z_hat, e_s(s)) . psi(g)` with the true state, so the
-actor can change only the action latent. Representation weights (CRL +
-`reconstruction_weight` x reconstruction) and actor weights (actor loss) have
-separate optimizers; the actor differentiates through fixed representation
-weights. See [contracts](docs/interfaces.md).
+`score` is `t * phi(z, e_s(s)) . psi(g)` with the true state. With the default
+`guidance: reencoded` the actor is scored on the latent of the chunk it would
+execute, `E(s, decoder(s, z_hat))`; `guidance: latent` scores `z_hat` directly
+(exploitable, kept as an ablation). Representation weights (CRL +
+`reconstruction_weight` x reconstruction, AdamW with `weight_decay` on weight
+matrices) and actor weights (actor loss, `actor_weight_decay`) have separate
+optimizers; the actor differentiates through fixed representation weights. See
+[contracts](docs/interfaces.md) and [method decisions](docs/method.md).
 
 ## Stages and initialization
 
 `train.stages` is a list of `representation` (encoder, heads, decoder),
 `actor` (actor only, representation fixed) and `joint` (both, each with its own
-objective from pre-update parameters). Shipped configs use one `joint` stage.
+objective from pre-update parameters). Task configs use one `joint` stage;
+`smoke.yaml` runs all three in order as an example.
 
 `init.checkpoint` starts a NEW run from another run's parameters:
 
@@ -96,10 +101,10 @@ and its path, SHA-256, modules and step are recorded in `metadata.json`.
 
 | Prefix | Meaning |
 | --- | --- |
-| `crl/` | loss, scale `t`, bias `b`, top-1 and binary accuracy, mean positive/negative logits |
+| `crl/` | loss, effective (capped) scale `t`, bias `b`, top-1 and binary accuracy, mean positive/negative logits; training reads noisy latents, validation clean ones |
 | `rec/` | chunk and first-action MSE (training: noisy decoder input); validation: clean, noisy and batch-shuffled latents |
 | `latent/` | per-dimension batch std; validation: `phi` change when actions vs states are swapped, and their ratio |
-| `actor/` | q/BC terms, actor and dataset-latent scores and their gain; validation: latent/action MSE to data, re-encoded score, `score_exploit_gap` (direct minus re-encoded score), cycle MSE |
+| `actor/` | q/BC terms, guided score vs dataset score; validation: `score_direct`, `score_reencoded`, `score_data`, `score_gain` (re-encoded minus data: real improvement), `score_exploit_gap` (direct minus re-encoded), latent/action/cycle MSE |
 | `grad/` | pre-clip norms; validation: CRL vs reconstruction on shared encoder, q vs BC on actor |
 | `evaluation/` | per-task and overall success |
 

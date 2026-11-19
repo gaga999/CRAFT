@@ -45,10 +45,26 @@ class ConfigTests(unittest.TestCase):
         )
         for path in paths:
             config = load_config(path)
-            self.assertEqual([s["name"] for s in config["train"]["stages"]], ["joint"])
+            stages = [s["name"] for s in config["train"]["stages"]]
+            expected = (
+                ["representation", "actor", "joint"]
+                if path.stem == "smoke"
+                else ["joint"]
+            )
+            self.assertEqual(stages, expected)
             self.assertIsNone(config["init"]["checkpoint"])
-            self.assertEqual(config["agent"]["bc_weight"], 10.0)
-            self.assertEqual(config["agent"]["latent_noise"], 0.2)
+            agent = config["agent"]
+            self.assertEqual(
+                (
+                    agent["bc_weight"],
+                    agent["latent_noise"],
+                    agent["guidance"],
+                    agent["max_scale"],
+                    agent["weight_decay"],
+                    agent["actor_weight_decay"],
+                ),
+                (1.0, 0.2, "reencoded", 30.0, 0.01, 0.0),
+            )
 
     def test_invalid_configs_fail_before_any_run(self):
         for override in [
@@ -58,6 +74,9 @@ class ConfigTests(unittest.TestCase):
             "agent.bc_weight=-1",
             "agent.latent_noise=-0.1",
             "agent.latent_noise=nan",
+            "agent.guidance=direct",
+            "agent.max_scale=1",
+            "agent.weight_decay=-0.1",
             "train.stages=[{name: action, steps: 1}]",
             "init.modules=[]",
             "init.modules=[decoder]",
