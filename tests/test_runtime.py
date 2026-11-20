@@ -77,15 +77,22 @@ class ConfigTests(unittest.TestCase):
             "agent.guidance=direct",
             "agent.max_scale=1",
             "agent.weight_decay=-0.1",
+            "agent.width=128",
+            "agent.similarity=l2",
+            "agent.actor_inputs=[goal]",
+            "agent.actor_inputs=[goal_embedding,goal_embedding]",
+            "agent.bc_weighting=awr",
+            "agent.advantage_baseline=value",
+            "agent.advantage_max_weight=0.5",
             "train.stages=[{name: action, steps: 1}]",
             "init.modules=[]",
             "init.modules=[decoder]",
             "init.modules=[actor,actor]",
-            "agent.width=1.5",
-            "agent.width=true",
+            "agent.action_encoder_width=1.5",
+            "agent.goal_encoder_depth=true",
             "agent.reconstruction_weight=nan",
             "agent.learning_rate=inf",
-            "agent.width=0",
+            "agent.head_depth=0",
             "data.discount=1",
             "logging.backend=typo",
             "train.stages=[]",
@@ -325,6 +332,50 @@ class RuntimeTests(unittest.TestCase):
             status = json.loads((actual / "status.json").read_text())
             self.assertEqual(status, {"status": "interrupted", "step": 1})
             self.assertTrue((actual / "checkpoint.msgpack").is_file())
+
+    def test_wandb_display_name_defaults_to_session_and_can_be_set(self):
+        import sys
+        import types
+
+        calls = []
+        fake = types.SimpleNamespace(
+            init=lambda **kw: (
+                calls.append(kw)
+                or types.SimpleNamespace(log=lambda *a, **k: None, finish=lambda: None)
+            )
+        )
+        c = load_config("configs/experiment/smoke.yaml", ["logging.backend=wandb"])
+        self.assertIsNone(c["logging"]["name"])
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(sys.modules, {"wandb": fake}),
+        ):
+            for name, expected in ((None, "session-a"), ("bc0.1-awbc", "bc0.1-awbc")):
+                session = Path(directory) / f"session-{len(calls) and 'b' or 'a'}"
+                session.mkdir()
+                c["logging"]["name"] = name
+                Logger(session, c).close()
+                self.assertEqual(calls[-1]["name"], expected)
+        with self.assertRaises(ValueError):
+            load_config("configs/experiment/smoke.yaml", ["logging.name=''"])
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "craft",
+                    "--config",
+                    "configs/experiment/smoke.yaml",
+                    "--dry-run",
+                    "--name",
+                    "0.1",
+                ],
+            ),
+            patch("builtins.print") as printed,
+        ):
+            from craft.cli import run
+
+            run()
+        self.assertIn("name: '0.1'", printed.call_args[0][0])
 
     def test_logger_rejects_duplicate_steps_and_append(self):
         with tempfile.TemporaryDirectory() as directory:

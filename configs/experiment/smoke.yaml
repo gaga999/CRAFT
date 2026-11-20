@@ -3,19 +3,36 @@ seed: 0
 output_dir: runs/smoke
 agent:
   chunk_length: 5
-  width: 16
-  depth: 2
+  # Representation capacity, per component.
+  action_encoder_width: 16
+  action_encoder_depth: 2
   exchange_every: 2
-  embedding_dim: 8
   latent_dim: 4
+  state_encoder_width: 16
+  state_encoder_depth: 1
+  goal_encoder_width: 16
+  goal_encoder_depth: 2
+  head_width: 16
+  head_depth: 1
+  embedding_dim: 8
+  decoder_width: 16
   decoder_depth: 1
+  # Critic score: cosine (t * cos + b, t <= max_scale) or dot (phi.psi / sqrt(D) + b).
+  similarity: cosine
+  max_scale: 30.0
+  # Actor. actor_inputs: subset of [goal_embedding, state_embedding].
   actor_width: 32
   actor_depth: 2
-  reconstruction_weight: 1.0
-  bc_weight: 1.0
-  latent_noise: 0.2
+  actor_inputs: []
   guidance: reencoded
-  max_scale: 30.0
+  bc_weight: 1.0
+  # bc_weighting: none | advantage (exp(beta * A) clipped; baseline actor | batch).
+  bc_weighting: none
+  advantage_beta: 1.0
+  advantage_max_weight: 100.0
+  advantage_baseline: actor
+  reconstruction_weight: 1.0
+  latent_noise: 0.2
   learning_rate: 0.0003
   actor_learning_rate: 0.0003
   weight_decay: 0.01
@@ -49,3 +66,4 @@ init:
 logging:
   backend: console
   project: craft
+  name: null

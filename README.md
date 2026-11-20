@@ -24,6 +24,12 @@ uv run ruff check .
 `--dry-run` validates/prints settings. OGBench downloads data on first use.
 Shipped real-task configs log to W&B (`WANDB_MODE=offline` for local runs,
 `logging.backend=console` to disable).
+The W&B display name defaults to the session directory name; set it with
+`--name` or `logging.name` to find ablations by name:
+
+```bash
+uv run craft --config configs/experiment/cube_double_play.yaml --name awbc-actor agent.bc_weighting=advantage
+```
 
 ### GPU (NVIDIA Linux)
 
@@ -62,21 +68,33 @@ Settings and their evidence are in [method details](docs/method.md).
 
 ```text
 (s, a_1..a_H) -> token Mixer -> action tokens -> Linear -> LayerNorm -> z [H, Z]
-s -> state encoder -> e_s;   phi = unit(MLP([flatten(z); e_s]));   psi = unit(MLP(g))
+s -> state encoder -> e_s;   phi = head([flatten(z); e_s]);   psi = goal_encoder(g)
 z~ = LN(z + sigma*eps)   (one sample, read by BOTH the head and the decoder)
-CRL: SigLIP  t * phi(z~).psi + b,  t <= max_scale     reconstruction: decoder(s, z~) -> A
-actor: (s, g) -> MLP -> LayerNorm -> z_hat -> decoder(s, z_hat) -> executed chunk A_hat
-actor loss: -score(s, E(s, A_hat), g) / sg(mean|score|) + bc_weight * |z_hat - sg(z)|^2
+critic logit: cosine  t * unit(phi).unit(psi) + b, t <= max_scale
+              dot     phi.psi / sqrt(D) + b      (no normalization, no temperature)
+reconstruction: decoder(s, z~) -> A
+actor: (s, g[, sg psi(g), sg e_s(s)]) -> MLP -> LayerNorm -> z_hat -> decoder -> A_hat
+actor loss: -score(s, E(s, A_hat), g) / sg(mean|score|) + bc_weight * mean_i w_i |z_hat_i - sg(z_i)|^2
 ```
 
-`score` is `t * phi(z, e_s(s)) . psi(g)` with the true state. With the default
+`score` is the logit without `b`, computed with the true state. With the default
 `guidance: reencoded` the actor is scored on the latent of the chunk it would
-execute, `E(s, decoder(s, z_hat))`; `guidance: latent` scores `z_hat` directly
-(exploitable, kept as an ablation). Representation weights (CRL +
-`reconstruction_weight` x reconstruction, AdamW with `weight_decay` on weight
-matrices) and actor weights (actor loss, `actor_weight_decay`) have separate
-optimizers; the actor differentiates through fixed representation weights. See
-[contracts](docs/interfaces.md) and [method decisions](docs/method.md).
+execute; `guidance: latent` scores `z_hat` directly (exploitable, kept as an
+ablation). Representation weights (CRL + `reconstruction_weight` x
+reconstruction, AdamW with `weight_decay` on weight matrices) and actor weights
+(`actor_weight_decay`) have separate optimizers; the actor differentiates
+through fixed representation weights and reads detached representation
+features. See [contracts](docs/interfaces.md) and [method decisions](docs/method.md).
+
+### Options
+
+| Key | Values | Effect |
+| --- | --- | --- |
+| `<component>_width`, `<component>_depth` | component: `action_encoder`, `state_encoder`, `goal_encoder`, `head`, `decoder`, `actor` | Capacity per component (`decoder_width`; `action_encoder_depth` is Mixer blocks; others are MLP hidden layers). Defaults reproduce the earlier shared-width model |
+| `similarity` | `cosine` (default), `dot` | Critic logit form; `max_scale` applies to `cosine` only |
+| `actor_inputs` | subset of `goal_embedding`, `state_embedding` | Extra detached actor inputs `psi(g)` and `e_s(s)` |
+| `bc_weighting` | `none` (default), `advantage` | Per-sample BC weight `w = min(exp(advantage_beta * A), advantage_max_weight)`, `A = (score(s, z_data, g) - baseline) / sg(mean abs score)` |
+| `advantage_baseline` | `actor` (default), `batch` | `actor`: the actor's own guided score per sample. `batch`: the batch-mean dataset score, which mixes states and goals and so also favours easy goals |
 
 ## Stages and initialization
 
@@ -99,27 +117,35 @@ and its path, SHA-256, modules and step are recorded in `metadata.json`.
 
 ## Metrics
 
-Each metric answers one question; read them together before tuning.
+Names are `<component>/<name>_<split>`: each W&B section is one component, and
+`_train` (training batch, noisy latents) sits next to `_val` (official
+validation split, clean latents, computed at each log step).
 
-| Metric | Question | Problem when |
-| --- | --- | --- |
-| `crl/loss` vs `validation/crl/loss` | Does the critic generalize? | the gap widens: overfitting |
-| `crl/scale` | Is the temperature at `max_scale`? | pinned at the cap for long |
-| `validation/crl/auc_<k>` | Does the critic still pick the true state `k` steps ahead over other samples' goals (0.5 = chance)? | near 0.5 at the distances tasks need: horizon too short |
-| `validation/latent/action_to_state_effect` | How much does `phi` move when actions vs states are swapped? | near 0: critic ignores actions |
-| `rec/mse`, `validation/rec/mse` | Does the decoder reconstruct chunks? | high |
-| `validation/rec/shuffled_latent_mse` | Does the decoder use `z`? | close to `rec/mse` |
-| `actor/q_loss`, `actor/bc` | Actor loss terms | |
-| `actor/score_gain` | Does the executed chunk beat the dataset chunk under the critic? | <= 0: guidance gives nothing |
-| `validation/actor/score_exploit_gap` | Is the actor's latent scored above the chunk it executes? | large: latent exploitation |
-| `validation/actor/action_mse` | How far are actor actions from data actions? | above the dataset action variance: out of distribution |
-| `validation/grad/crl_to_rec_ratio`, `validation/grad/q_to_bc_ratio` | Gradient balance of each optimizer's objectives | one term dominates |
-| `grad/representation_norm`, `grad/actor_norm` | Pre-clip gradient norms | spikes or clipping |
-| `evaluation/*/success` | Task success | |
+| Component | Metric | Diagnoses | Problem when |
+| --- | --- | --- | --- |
+| critic | `loss_train` / `loss_val` | Generalization | gap widens: overfitting |
+| | `scale_train` (cosine) | Temperature | pinned at `max_scale` |
+| | `top1_val`, `logit_positive_val`, `logit_negative_val` | Ranking and calibration on the training goal distribution | positives drift down while train improves |
+| | `auc_<k>_val` (k = 5, 20, 50, 100, 200) | Effective horizon: true state k steps ahead vs other samples' goals | near 0.5 at the distances tasks need |
+| | `action_effect_val`, `state_effect_val`, `action_to_state_effect_val` | Change of `phi` when actions or states are swapped | action effect near 0: critic ignores actions |
+| | `phi_norm_val`, `psi_norm_val` | Unnormalized embedding norms (confidence under `dot`) | growing without bound |
+| decoder | `rec_train` / `rec_val`, `rec_first_val` | Reconstruction (whole chunk, executed first step) | high |
+| | `rec_noisy_val` | Robustness at the training noise level | far above `rec_val` |
+| | `rec_shuffled_val` | Decoder uses `z` | close to `rec_val` |
+| latent | `batch_std_val` | Spread of `z` across samples | near 0: collapse |
+| actor | `q_loss_train`, `bc_train` | Loss terms (BC after weighting) | |
+| | `score_gain_train`, `score_gain_val` | Executed chunk vs dataset chunk under the critic | <= 0: guidance gives nothing |
+| | `score_data_val` | Level of dataset scores | reference for the two above |
+| | `exploit_gap_val` | Latent scored above its executed chunk | large: latent exploitation |
+| | `action_mse_rel_val` | Actor-vs-data action MSE / data action variance | > 1: out of distribution |
+| | `latent_mse_val`, `cycle_mse_val` | Distance from data latents; off the encoder's image | cycle large: decoder input unlike training |
+| | `goal_sensitivity_val` | Action change when goals are swapped / data variance | near 0: actor ignores the goal |
+| | `advantage_train`, `weight_mean_*`, `weight_clipped_*` (advantage BC) | Weight distribution | most weights clipped or all near 1 |
+| balance | `grad_norm_representation_train`, `grad_norm_actor_train` | Pre-clip gradient norms | spikes or clipping |
+| | `crl_to_rec_val`, `q_to_bc_val` | Gradient ratio of each optimizer's two terms | one term dominates |
+| evaluation | `<task>/success`, `overall_success` | Task success | |
 
-Training metrics use the training batch (noisy latents); `validation/*` uses the
-official validation split with clean latents at each log step. `auc_<k>` uses
-5, 20, 50, 100 and 200 steps; distances longer than every episode are skipped.
+`time/` holds per-step data wait and update time.
 
 ## Throughput
 

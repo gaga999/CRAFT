@@ -6,11 +6,14 @@
   gather; one private RNG plans samples; the checkpointed sampler advances only
   after an accepted update.
 - Representation: `latent(s, A) -> z [B,H,Z]` with mean 0 and RMS 1 per token;
-  `phi`, `psi` unit `[B,D]`; `decode(s, z) -> [B,H,A]` in (-1, 1) via tanh;
-  `score(s, z, g) = t phi(z, e_s(s)) . psi(g)` (no bias), `t = min(exp(log_scale), max_scale)`.
-- Actor: `(s, g) -> z_hat`, normalized like `z`; guided by
+  `phi`, `psi` `[B,D]` (unit for `cosine`, raw for `dot`); `decode(s, z) -> [B,H,A]`
+  in (-1, 1) via tanh; `logits = temperature * phi.psi + b` with temperature
+  `min(exp(log_scale), max_scale)` (cosine) or `1/sqrt(D)` (dot);
+  `score(s, z, g)` is the logit without `b`.
+- Actor: `(s, g[, condition]) -> z_hat`, normalized like `z`; `condition` is the
+  detached `psi(g)` and/or `e_s(s)` named by `actor_inputs`. Guided by
   `score(s, latent(s, decode(s, z_hat)), g)` (`guidance: reencoded`). Inference is
-  `decode(s, actor(s, g))`; no dataset action or randomness is used.
+  `decode(s, actor(s, g, condition))`; no dataset action or randomness is used.
 - Ownership: CRL updates encoder, state/goal encoders, head, `t`, `b`;
   reconstruction updates encoder and decoder; actor loss updates only the actor.
   All gradients of one step use pre-update parameters; `joint` equals the

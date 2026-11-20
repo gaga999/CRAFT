@@ -10,19 +10,36 @@ from omegaconf import OmegaConf
 @dataclass
 class AgentConfig:
     chunk_length: int = 5
-    width: int = 128
-    depth: int = 4
+    # Representation capacity, per component.
+    action_encoder_width: int = 128
+    action_encoder_depth: int = 4
     exchange_every: int = 2
-    embedding_dim: int = 128
     latent_dim: int = 8
+    state_encoder_width: int = 128
+    state_encoder_depth: int = 1
+    goal_encoder_width: int = 128
+    goal_encoder_depth: int = 2
+    head_width: int = 128
+    head_depth: int = 1
+    embedding_dim: int = 128
+    decoder_width: int = 128
     decoder_depth: int = 2
+    # Critic score: "cosine" (t * cos + b, t <= max_scale) or "dot" (phi.psi/sqrt(D) + b).
+    similarity: str = "cosine"
+    max_scale: float = 30.0
+    # Actor.
     actor_width: int = 256
     actor_depth: int = 3
-    reconstruction_weight: float = 1.0
-    bc_weight: float = 1.0
-    latent_noise: float = 0.2
+    actor_inputs: list[str] = field(default_factory=list)
     guidance: str = "reencoded"
-    max_scale: float = 30.0
+    bc_weight: float = 1.0
+    bc_weighting: str = "none"
+    advantage_beta: float = 1.0
+    advantage_max_weight: float = 100.0
+    advantage_baseline: str = "actor"
+    # Objectives and optimization.
+    reconstruction_weight: float = 1.0
+    latent_noise: float = 0.2
     learning_rate: float = 0.0003
     actor_learning_rate: float = 0.0003
     weight_decay: float = 0.01
@@ -74,6 +91,8 @@ class InitConfig:
 class LoggingConfig:
     backend: str = "console"
     project: str = "craft"
+    # W&B display name; null uses the session directory name.
+    name: str | None = None
 
 
 @dataclass
@@ -108,14 +127,21 @@ def validate_agent(config):
     expected = set(OmegaConf.to_container(OmegaConf.structured(AgentConfig)))
     if set(config) != expected:
         raise ValueError(
-            f"Agent configuration keys differ: {set(config) ^ expected}. CVAE/prior configs are incompatible with the latent-actor schema."
+            f"Agent configuration keys differ: {set(config) ^ expected}. Capacity keys are per component (e.g. action_encoder_width, goal_encoder_depth)."
         )
     for key in (
         "chunk_length",
-        "width",
-        "depth",
+        "action_encoder_width",
+        "action_encoder_depth",
         "exchange_every",
+        "state_encoder_width",
+        "state_encoder_depth",
+        "goal_encoder_width",
+        "goal_encoder_depth",
+        "head_width",
+        "head_depth",
         "embedding_dim",
+        "decoder_width",
         "decoder_depth",
         "actor_width",
         "actor_depth",
@@ -131,11 +157,30 @@ def validate_agent(config):
         "latent_noise",
         "weight_decay",
         "actor_weight_decay",
+        "advantage_beta",
     ):
         finite_float(config[key], f"agent.{key}", strict=False)
     finite_float(config["max_scale"], "agent.max_scale", 1)
-    if config["guidance"] not in ("reencoded", "latent"):
-        raise ValueError("agent.guidance must be reencoded or latent")
+    finite_float(
+        config["advantage_max_weight"], "agent.advantage_max_weight", 1, strict=False
+    )
+    choices = {
+        "similarity": ("cosine", "dot"),
+        "guidance": ("reencoded", "latent"),
+        "bc_weighting": ("none", "advantage"),
+        "advantage_baseline": ("actor", "batch"),
+    }
+    for key, allowed in choices.items():
+        if config[key] not in allowed:
+            raise ValueError(f"agent.{key} must be one of {allowed}")
+    inputs = config["actor_inputs"]
+    if len(set(inputs)) != len(inputs) or not set(inputs) <= {
+        "goal_embedding",
+        "state_embedding",
+    }:
+        raise ValueError(
+            "agent.actor_inputs must be a unique subset of [goal_embedding, state_embedding]"
+        )
 
 
 def load_config(path, overrides=()):
@@ -225,6 +270,9 @@ def validate_config(config):
         raise ValueError("init.checkpoint must be null or a checkpoint path")
     if config["logging"]["backend"] not in ("console", "wandb"):
         raise ValueError("logging.backend must be console or wandb")
+    name = config["logging"]["name"]
+    if name is not None and (not isinstance(name, str) or not name.strip()):
+        raise ValueError("logging.name must be null or a non-empty string")
     for value in (
         config["output_dir"],
         config["logging"]["project"],

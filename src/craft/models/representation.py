@@ -1,8 +1,10 @@
 """CRL representation whose action latent is also the decoder/actor space.
 
 (s, A) -> token backbone -> per-action latent z [B,H,Z] (parameter-free LayerNorm)
-s -> state encoder e_s;  phi = unit(head([flatten(z); e_s]));  psi = unit(psi(g))
-SigLIP logit = t * phi.psi + bias, t = min(exp(log_scale), max_scale);  decoder(s, z) -> A.
+s -> state encoder e_s;  phi = head([flatten(z); e_s]);  psi = goal_encoder(g)
+similarity "cosine": logit = t * unit(phi).unit(psi) + b, t = min(exp(log_scale), max_scale)
+similarity "dot":    logit = phi.psi / sqrt(D) + b (confidence lives in the norms)
+decoder(s, z) -> A.
 """
 
 import math
@@ -11,7 +13,6 @@ import jax.numpy as jnp
 from flax import nnx
 
 from craft.models.mlp import MLP
-from craft.models.similarity import siglip_logits
 from craft.models.tokens import TokenBackbone, TokenMixer
 
 
@@ -33,7 +34,7 @@ class ChunkDecoder(nnx.Module):
     """(s, z) -> bounded chunk. State enters as a token AND as an additive skip."""
 
     def __init__(self, observation_dim, action_dim, config, *, rngs):
-        w, h = config["width"], config["chunk_length"]
+        w, h = config["decoder_width"], config["chunk_length"]
         self.state_token = nnx.Linear(observation_dim, w, rngs=rngs)
         self.state_skip = nnx.Linear(observation_dim, w, rngs=rngs)
         self.latent_projection = nnx.Linear(config["latent_dim"], w, rngs=rngs)
@@ -55,29 +56,51 @@ class ChunkDecoder(nnx.Module):
 
 class Representation(nnx.Module):
     def __init__(self, observation_dim, action_dim, config, *, rngs, batch_size):
-        w, h, z, d = (
-            config[k] for k in ("width", "chunk_length", "latent_dim", "embedding_dim")
-        )
+        h, z, d = (config[k] for k in ("chunk_length", "latent_dim", "embedding_dim"))
+        w = config["action_encoder_width"]
         self.backbone = TokenBackbone(
             observation_dim,
             action_dim,
             h,
             width=w,
-            depth=config["depth"],
+            depth=config["action_encoder_depth"],
             exchange_every=config["exchange_every"],
             rngs=rngs,
         )
         self.latent_projection = nnx.Linear(w, z, rngs=rngs)
-        self.state_encoder = MLP(observation_dim, (w,), w, layer_norm=True, rngs=rngs)
-        # Simplified nonlinear fuse: one hidden layer over [flatten(z); e_s].
-        self.head = MLP(h * z + w, (w,), d, rngs=rngs)
-        self.goal_encoder = MLP(observation_dim, (w, w), d, layer_norm=True, rngs=rngs)
+        sw = config["state_encoder_width"]
+        self.state_encoder = MLP(
+            observation_dim,
+            (sw,) * config["state_encoder_depth"],
+            sw,
+            layer_norm=True,
+            rngs=rngs,
+        )
+        # Nonlinear fuse over [flatten(z); e_s].
+        self.head = MLP(
+            h * z + sw, (config["head_width"],) * config["head_depth"], d, rngs=rngs
+        )
+        self.goal_encoder = MLP(
+            observation_dim,
+            (config["goal_encoder_width"],) * config["goal_encoder_depth"],
+            d,
+            layer_norm=True,
+            rngs=rngs,
+        )
         self.decoder = ChunkDecoder(observation_dim, action_dim, config, rngs=rngs)
-        self.log_scale = nnx.Param(jnp.log(jnp.array(10.0, jnp.float32)))
-        # Upper bound on the temperature; above it log_scale gets no gradient.
-        self.max_log_scale = math.log(config["max_scale"])
+        self.similarity = config["similarity"]
+        if self.similarity == "cosine":
+            self.log_scale = nnx.Param(jnp.log(jnp.array(10.0, jnp.float32)))
+            # Upper bound on the temperature; above it log_scale gets no gradient.
+            self.max_log_scale = math.log(config["max_scale"])
+        else:
+            # Reference CRL scaling: the norms carry confidence; no temperature.
+            self.dot_scale = 1 / math.sqrt(d)
         # Optimal binary-NCE logit offset for 1 positive : B-1 negatives.
         self.bias = nnx.Param(-jnp.log(jnp.array(batch_size - 1.0, jnp.float32)))
+
+    def _embedding(self, raw):
+        return unit(raw) if self.similarity == "cosine" else raw
 
     def latent(self, states, actions):
         tokens = self.backbone(states, actions)[:, 1:]
@@ -86,50 +109,74 @@ class Representation(nnx.Module):
     def state_features(self, states):
         return self.state_encoder(states)
 
+    def head_output(self, z, state_features):
+        """Unnormalized phi (its norm is a diagnostic in both similarity modes)."""
+        return self.head(
+            jnp.concatenate([z.reshape(z.shape[0], -1), state_features], -1)
+        )
+
     def embed(self, z, state_features):
-        flat = z.reshape(z.shape[0], -1)
-        return unit(self.head(jnp.concatenate([flat, state_features], -1)))
+        return self._embedding(self.head_output(z, state_features))
 
     def goal(self, goals):
-        return unit(self.goal_encoder(goals))
+        return self._embedding(self.goal_encoder(goals))
 
     def phi(self, states, actions):
         return self.embed(self.latent(states, actions), self.state_features(states))
 
-    def log_temperature(self):
-        return jnp.minimum(self.log_scale[...], self.max_log_scale)
+    def temperature(self):
+        if self.similarity == "cosine":
+            return jnp.exp(jnp.minimum(self.log_scale[...], self.max_log_scale))
+        return self.dot_scale
 
     def logits(self, phi, psi, *, pairwise=False):
-        return siglip_logits(
-            phi, psi, self.log_temperature(), self.bias[...], pairwise=pairwise
+        similarity = (
+            jnp.einsum("id,jd->ij", phi, psi) if pairwise else jnp.sum(phi * psi, -1)
         )
+        return self.temperature() * similarity + self.bias[...]
 
     def score(self, states, z, goals):
-        """Actor objective: scaled similarity of latent z under the TRUE state.
+        """Actor objective: the critic logit of latent z under the TRUE state.
 
         The bias is a constant (no gradient) and is omitted so that score
         normalization reflects similarity, not the batch-size offset.
         """
         phi = self.embed(z, self.state_features(states))
-        return jnp.exp(self.log_temperature()) * jnp.sum(phi * self.goal(goals), -1)
+        return self.temperature() * jnp.sum(phi * self.goal(goals), -1)
 
     def decode(self, states, z):
         return self.decoder(states, z)
 
 
+ACTOR_INPUTS = ("goal_embedding", "state_embedding")
+
+
+def actor_condition_dim(config):
+    sizes = {
+        "goal_embedding": config["embedding_dim"],
+        "state_embedding": config["state_encoder_width"],
+    }
+    return sum(sizes[name] for name in config["actor_inputs"])
+
+
 class LatentActor(nnx.Module):
-    """Deterministic (s, g) -> z on the encoder's normalized latent set."""
+    """Deterministic (s, g[, condition]) -> z on the encoder's latent set.
+
+    `condition` is the detached representation features named by
+    `actor_inputs`; the actor never updates the representation.
+    """
 
     def __init__(self, observation_dim, config, *, rngs):
         self.shape = (config["chunk_length"], config["latent_dim"])
         self.network = MLP(
-            2 * observation_dim,
+            2 * observation_dim + actor_condition_dim(config),
             (config["actor_width"],) * config["actor_depth"],
             self.shape[0] * self.shape[1],
             layer_norm=True,
             rngs=rngs,
         )
 
-    def __call__(self, states, goals):
-        out = self.network(jnp.concatenate([states, goals], -1))
+    def __call__(self, states, goals, condition=None):
+        parts = [states, goals] + ([] if condition is None else [condition])
+        out = self.network(jnp.concatenate(parts, -1))
         return normalize_latent(out.reshape(states.shape[0], *self.shape))

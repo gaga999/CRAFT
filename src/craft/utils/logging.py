@@ -18,7 +18,7 @@ class Logger:
                     project=config["logging"]["project"],
                     config=config,
                     dir=str(directory),
-                    name=directory.name,
+                    name=config["logging"]["name"] or directory.name,
                     resume="never",
                 )
             elif config["logging"]["backend"] != "console":

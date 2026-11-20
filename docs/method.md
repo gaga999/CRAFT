@@ -57,7 +57,7 @@ direct score 5.44 -> 9.31 while the re-encoded score stayed 5.41 -> 5.36,
 although decoded actions changed (MSE 0.27): the head extrapolates off the
 encoder's image. Success (cube 0.20 -> 0.54, puzzle <= 0.22, 10 episodes/task)
 is therefore attributable to latent BC, not guidance. Hence `guidance:
-reencoded` and noisy CRL; `actor/score_gain` now measures re-encoded minus
+reencoded` and noisy CRL; `actor/score_gain_val` measures re-encoded minus
 dataset score.
 
 ## Actor
@@ -124,7 +124,29 @@ against goals exactly k steps ahead:
 
 With `discount = 0.95` (mean goal offset about 20 steps) the critic is near
 chance at the 100-190 steps the failing tasks need, so guidance cannot help
-there. `validation/crl/auc_<k>` tracks this during training.
+there. `critic/auc_<k>_val` tracks this during training.
+
+## Options under test
+
+All default off or to the earlier behaviour; none has a measured benefit yet.
+
+- `similarity: dot` (reference CRL form plus a learned bias): per-sample
+  confidence in `||phi||`, `||psi||`. Weight decay then also limits logit scale,
+  and `max_scale` no longer applies. Expected to change calibration, not the
+  puzzle horizon, whose failure is ranking (see above). Watch `phi_norm_val`,
+  `psi_norm_val` and the loss gap.
+- Encoder capacity: the puzzle probe found `psi` represents lights exactly but
+  not the GF(2) press parities that press distance is bilinear in; widen or
+  deepen `goal_encoder`/`state_encoder`/`head` before removing the latent.
+- `actor_inputs`: on `cube-double-play-v0` the actor changed its actions by 6%
+  of data variance when goals were swapped (29% on cube-single); detached
+  `psi(g)` makes the goal more salient. In `joint` these inputs drift with the
+  representation.
+- `bc_weighting: advantage`: on play data, uniform hindsight goals barely
+  inform the current action, so plain latent BC is goal-blind. Weighting by
+  `exp(beta * A)` imitates data chunks the critic prefers for that goal. The
+  `actor` baseline is per sample; `batch` compares samples with different goals
+  and so also up-weights easy (near) goals.
 
 ## Diagnostics to read before conclusions
 

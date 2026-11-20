@@ -10,11 +10,11 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
-from craft.agents.craft import CRAFTAgent, pairwise_auc
+from craft.agents.craft import CRAFTAgent
 from craft.config import load_config
 from craft.data.offline import OfflineDataset, synthetic_dataset
-from craft.losses.actor import actor_loss
-from craft.losses.contrastive import contrastive_loss
+from craft.losses.actor import actor_loss, advantage_weights
+from craft.losses.contrastive import contrastive_loss, pairwise_auc
 from craft.losses.reconstruction import reconstruction_mse
 from craft.models.tokens import MixerBlock
 from craft.utils.checkpoint import (
@@ -142,6 +142,53 @@ class MixerTests(unittest.TestCase):
                 self.assertNotIn("transpose[", primitives)
 
 
+VALIDATION_METRICS = {
+    f"{name}_val"
+    for name in (
+        "critic/loss",
+        "critic/top1",
+        "critic/logit_positive",
+        "critic/logit_negative",
+        "critic/action_effect",
+        "critic/state_effect",
+        "critic/action_to_state_effect",
+        "critic/phi_norm",
+        "critic/psi_norm",
+        "decoder/rec",
+        "decoder/rec_first",
+        "decoder/rec_noisy",
+        "decoder/rec_shuffled",
+        "latent/batch_std",
+        "actor/score_data",
+        "actor/score_gain",
+        "actor/exploit_gap",
+        "actor/action_mse_rel",
+        "actor/latent_mse",
+        "actor/cycle_mse",
+        "actor/goal_sensitivity",
+        "balance/crl_to_rec",
+        "balance/q_to_bc",
+    )
+}
+TRAIN_METRICS = {
+    f"{name}_train"
+    for name in (
+        "critic/loss",
+        "critic/scale",
+        "decoder/rec",
+        "actor/q_loss",
+        "actor/bc",
+        "actor/score_gain",
+        "balance/grad_norm_representation",
+        "balance/grad_norm_actor",
+    )
+} | {"numerics/finite"}
+
+
+def variant(config, **changes):
+    return seeded_agent(0, 6, 2, {**config, **changes})
+
+
 class AgentTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -189,12 +236,12 @@ class AgentTests(unittest.TestCase):
         np.testing.assert_allclose(
             rep.score(s, rep.latent(s, a), g), jnp.diag(logits) + 2, atol=1e-5
         )
-        loss, metrics = contrastive_loss(phi, psi, rep.log_scale[...], rep.bias[...])
+        loss = contrastive_loss(rep.logits(phi, psi, pairwise=True))
         labels = 2 * jnp.eye(4) - 1
         np.testing.assert_allclose(
             loss, -jax.nn.log_sigmoid(labels * logits).sum(-1).mean(), rtol=1e-6
         )
-        np.testing.assert_allclose(metrics["crl/scale"], 3.0, rtol=1e-6)
+        np.testing.assert_allclose(rep.temperature(), 3.0, rtol=1e-6)
         # AUC: fraction of off-diagonal pairs the true goal outscores.
         wins = sum(
             float(logits[i, i] > logits[i, j])
@@ -212,9 +259,7 @@ class AgentTests(unittest.TestCase):
 
         def crl(model):
             phi = model.embed(model.latent(s, a), model.state_features(s))
-            return contrastive_loss(
-                phi, model.goal(g), model.log_scale[...], model.bias[...]
-            )[0]
+            return contrastive_loss(model.logits(phi, model.goal(g), pairwise=True))
 
         def rec(model):
             return reconstruction_mse(model.decode(s, model.latent(s, a)), a)
@@ -309,7 +354,7 @@ class AgentTests(unittest.TestCase):
         noisy_terms = self.initial.representation_objective(rep, self.b, key)[1][0]
         again = self.initial.representation_objective(rep, self.b, key)[1][0]
         quiet_terms = quiet.representation_objective(rep, self.b, key)[1][0]
-        for name in ("crl/loss", "rec/mse"):
+        for name in ("critic/loss_train", "decoder/rec_train"):
             self.assertNotEqual(float(noisy_terms[name]), float(quiet_terms[name]))
             self.assertEqual(float(noisy_terms[name]), float(again[name]))
 
@@ -384,24 +429,10 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(equal(before, pure_state(self.a)))
         self.assertTrue(all(np.isfinite(v) for v in first.values()))
         self.assertEqual(
-            set(first),
-            {
-                f"validation/{name}"
-                for name in (
-                    "crl/loss",
-                    "crl/auc_5",
-                    "crl/auc_20",
-                    "latent/action_to_state_effect",
-                    "rec/mse",
-                    "rec/shuffled_latent_mse",
-                    "actor/score_gain",
-                    "actor/score_exploit_gap",
-                    "actor/action_mse",
-                    "grad/crl_to_rec_ratio",
-                    "grad/q_to_bc_ratio",
-                )
-            },
+            set(first), VALIDATION_METRICS | {"critic/auc_5_val", "critic/auc_20_val"}
         )
+        train = nnx.clone(self.initial).update(self.b)
+        self.assertEqual(set(train), TRAIN_METRICS)
 
     def test_offset_sampler_returns_exact_future_states_or_none(self):
         source = seeded_source()[0]
@@ -436,7 +467,9 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(int(self.a.step[...]), 3)
         assert_equivalent_training(self, sequential, self.a, 3, self.c, batches[0])
         self.assertAlmostEqual(
-            float(metrics["crl/loss"]), float(last["crl/loss"]), places=4
+            float(metrics["critic/loss_train"]),
+            float(last["critic/loss_train"]),
+            places=4,
         )
         before = pure_state(self.a)
         bad = jax.tree.map(np.array, stacked)
@@ -478,3 +511,89 @@ class AgentTests(unittest.TestCase):
                     modules=["representation", "actor"],
                 )
             self.assertTrue(equal(before, pure_state(fresh)))
+
+
+class OptionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.c = load_config("configs/experiment/smoke.yaml")["agent"]
+        cls.b = seeded_source()[0].sample(4)
+
+    def test_component_capacity_is_independent(self):
+        agent = variant(
+            self.c,
+            state_encoder_width=24,
+            state_encoder_depth=3,
+            goal_encoder_width=20,
+            goal_encoder_depth=4,
+            head_width=12,
+            head_depth=2,
+            decoder_width=10,
+            action_encoder_width=14,
+        )
+        rep = agent.representation
+        self.assertEqual(len(rep.state_encoder.layers), 4)
+        self.assertEqual(rep.state_encoder.layers[-1].out_features, 24)
+        self.assertEqual(len(rep.goal_encoder.layers), 5)
+        self.assertEqual(rep.goal_encoder.layers[0].out_features, 20)
+        self.assertEqual(len(rep.head.layers), 3)
+        self.assertEqual(rep.head.layers[0].in_features, 5 * 4 + 24)
+        self.assertEqual(rep.decoder.position.shape, (1, 6, 10))
+        self.assertEqual(rep.backbone.position.shape, (1, 6, 14))
+        self.assertTrue(bool(agent.update(self.b)["numerics/finite"]))
+
+    def test_dot_similarity_has_no_temperature_and_uses_raw_norms(self):
+        agent = variant(self.c, similarity="dot")
+        rep = agent.representation
+        self.assertFalse(hasattr(rep, "log_scale"))
+        s, a, g = (self.b[k] for k in ("observations", "action_chunks", "value_goals"))
+        phi, psi = rep.phi(s, a), rep.goal(g)
+        self.assertFalse(np.allclose(jnp.linalg.norm(phi, axis=-1), 1))
+        expected = phi @ psi.T / np.sqrt(self.c["embedding_dim"]) + rep.bias[...]
+        np.testing.assert_allclose(
+            rep.logits(phi, psi, pairwise=True), expected, rtol=1e-5, atol=1e-6
+        )
+        np.testing.assert_allclose(
+            rep.score(s, rep.latent(s, a), g),
+            jnp.diag(expected) - rep.bias[...],
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        metrics = agent.update(self.b)
+        self.assertTrue(bool(metrics["numerics/finite"]))
+        self.assertNotIn("critic/scale_train", metrics)
+
+    def test_actor_inputs_are_detached_representation_features(self):
+        agent = variant(self.c, actor_inputs=["goal_embedding", "state_embedding"])
+        expected = 2 * 6 + self.c["embedding_dim"] + self.c["state_encoder_width"]
+        self.assertEqual(agent.actor.network.layers[0].in_features, expected)
+        before = pure_state(agent.representation)
+        self.assertTrue(bool(agent.update(self.b, stage="actor")["numerics/finite"]))
+        self.assertTrue(equal(before, pure_state(agent.representation)))
+        s, g = self.b["observations"], self.b["value_goals"]
+        self.assertEqual(agent.policy()(s, g).shape, (4, 5, 2))
+        self.assertEqual(agent.policy()(s[0], g[0]).shape, (5, 2))
+
+    def test_advantage_weighted_bc(self):
+        data = jnp.array([2.0, 0.0, -2.0, 50.0])
+        weights, adv = advantage_weights(data, jnp.zeros(4), 1.0, 5.0)
+        np.testing.assert_allclose(adv, data / jnp.abs(data).mean(), rtol=1e-6)
+        np.testing.assert_allclose(weights, jnp.minimum(jnp.exp(adv), 5.0), rtol=1e-6)
+        z_hat = jnp.ones((4, 5, 4))
+        z = jnp.zeros((4, 5, 4))
+        plain = actor_loss(data, z_hat, z, 1.0)[1][1]
+        unit_weights = actor_loss(data, z_hat, z, 1.0, jnp.ones(4))[1][1]
+        np.testing.assert_allclose(plain, unit_weights)
+        for baseline in ("actor", "batch"):
+            agent = variant(
+                self.c,
+                bc_weighting="advantage",
+                advantage_baseline=baseline,
+                advantage_max_weight=3.0,
+            )
+            metrics = agent.update(self.b, stage="actor")
+            self.assertTrue(bool(metrics["numerics/finite"]))
+            self.assertLessEqual(float(metrics["actor/weight_mean_train"]), 3.0)
+            self.assertIn("actor/weight_clipped_train", metrics)
+            val = agent.validation_metrics(self.b, jax.random.key(0), {})
+            self.assertIn("actor/weight_mean_val", val)
