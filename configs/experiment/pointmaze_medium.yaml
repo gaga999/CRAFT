@@ -43,21 +43,21 @@ data:
   directory: data/ogbench
   path: null
   synthetic: false
-  batch_size: 256
+  batch_size: 1024
   discount: 0.99
-  workers: 2
-  prefetch_batches: 4
-  device_prefetch: 2
+  workers: 3
+  prefetch_batches: 6
+  device_prefetch: 3
 train:
   stages:
     - name: joint
       steps: 300000
   log_interval: 1000
-  eval_interval: 25000
+  eval_interval: 50000
   save_interval: 25000
 evaluation:
   episodes: 5
-  execution_length: 1
+  execution_length: 2
 init:
   checkpoint: null
   modules: [representation, actor]

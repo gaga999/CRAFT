@@ -45,19 +45,19 @@ data:
   synthetic: false
   batch_size: 1024
   discount: 0.95
-  workers: 2
-  prefetch_batches: 4
-  device_prefetch: 2
+  workers: 3
+  prefetch_batches: 6
+  device_prefetch: 3
 train:
   stages:
     - name: joint
       steps: 1000000
   log_interval: 1000
-  eval_interval: 50000
+  eval_interval: 100000
   save_interval: 50000
 evaluation:
   episodes: 10
-  execution_length: 1
+  execution_length: 2
 init:
   checkpoint: null
   modules: [representation, actor]

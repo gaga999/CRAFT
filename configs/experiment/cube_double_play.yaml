@@ -8,10 +8,10 @@ agent:
   action_encoder_depth: 4
   exchange_every: 2
   latent_dim: 8
-  state_encoder_width: 128
-  state_encoder_depth: 1
-  goal_encoder_width: 128
-  goal_encoder_depth: 2
+  state_encoder_width: 256
+  state_encoder_depth: 3
+  goal_encoder_width: 256
+  goal_encoder_depth: 4
   head_width: 128
   head_depth: 1
   embedding_dim: 128
@@ -43,7 +43,7 @@ data:
   directory: data/ogbench
   path: null
   synthetic: false
-  batch_size: 256
+  batch_size: 1024
   discount: 0.95
   workers: 2
   prefetch_batches: 4
@@ -53,11 +53,11 @@ train:
     - name: joint
       steps: 1000000
   log_interval: 1000
-  eval_interval: 50000
+  eval_interval: 100000
   save_interval: 50000
 evaluation:
   episodes: 10
-  execution_length: 1
+  execution_length: 2
 init:
   checkpoint: null
   modules: [representation, actor]
